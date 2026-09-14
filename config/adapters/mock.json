@@ -1,0 +1,7 @@
+{
+  "id": "mock",
+  "enabled": true,
+  "credentialsSource": "inline",
+  "priority": 0,
+  "credentials": { "tasksPerCycle": 1, "taskPoolSize": 4 }
+}

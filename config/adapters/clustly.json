@@ -1,0 +1,7 @@
+{
+  "id": "clustly",
+  "enabled": false,
+  "credentialsSource": "env",
+  "priority": 3,
+  "credentials": { "source": "env", "prefix": "CLUSTLY_" }
+}

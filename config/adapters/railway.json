@@ -1,0 +1,7 @@
+{
+  "id": "railway",
+  "enabled": false,
+  "credentialsSource": "env",
+  "priority": 1,
+  "credentials": { "source": "env", "prefix": "RAILWAY_" }
+}

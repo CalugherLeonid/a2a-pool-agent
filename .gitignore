@@ -1,0 +1,42 @@
+
+---
+
+### `.gitignore`
+
+```gitignore
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Secrets / keys — NEVER commit
+keys/
+*.key
+*.pem
+!keys/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Runtime state
+okx-state/
+.clustly-state/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

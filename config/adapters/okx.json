@@ -1,0 +1,7 @@
+{
+  "id": "okx",
+  "enabled": false,
+  "credentialsSource": "env",
+  "priority": 2,
+  "credentials": { "source": "env", "prefix": "OKX_" }
+}
