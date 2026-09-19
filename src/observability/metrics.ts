@@ -1,8 +1,8 @@
 /**
  * Aggregate metrics computed from the database.
  *
- * All queries are read-only and can be called on demand (dashboard,
- * daily review, alerts). They are grouped by window (in days).
+ * Toate query-urile sunt filtrate pe environment-ul agentului curent.
+ * Astfel development si staging raman izolate.
  */
 
 import { query } from '../persistence/pool.js';
@@ -61,6 +61,8 @@ export interface Alert {
 }
 
 export class Metrics {
+  constructor(private readonly environment: string) {}
+
   async overview(windowDays = 1): Promise<OverviewMetrics> {
     const res = await query<{
       total_tasks: string;
@@ -78,8 +80,9 @@ export class Metrics {
          COALESCE(SUM(profit_usd), 0)::text            AS total_profit,
          COALESCE(AVG(actual_latency_s), 0)::text      AS avg_latency
        FROM learning_events
-       WHERE ts > now() - ($1 || ' days')::interval`,
-      [String(windowDays)],
+       WHERE environment = $1
+         AND ts > now() - ($2 || ' days')::interval`,
+      [this.environment, String(windowDays)],
     );
 
     const r = res.rows[0]!;
@@ -89,20 +92,23 @@ export class Metrics {
     const totalCostUsd = Number(r.total_cost);
     const totalProfitUsd = Number(r.total_profit);
 
-    // Rejected tasks are computed as accepted-attempts minus delivered;
-    // in V1 we approximate rejected as the difference between ledger
-    // transactions and learning events, but since both are equal, we
-    // track it via a separate query on a future table. For now: 0.
     const rejectedTasks = 0;
 
     const ledgerRes = await query<{ n: string }>(
       `SELECT COUNT(*)::text AS n
        FROM (
-         SELECT transaction_id
-         FROM ledger_entries
-         GROUP BY transaction_id
-         HAVING ABS(SUM(debit) - SUM(credit)) > 0.00000001
-       ) t`,
+         SELECT le.transaction_id
+         FROM ledger_entries le
+         JOIN transactions t ON t.id = le.transaction_id
+         WHERE t.task_id IN (
+           SELECT DISTINCT task_id
+           FROM learning_events
+           WHERE environment = $1
+         )
+         GROUP BY le.transaction_id
+         HAVING ABS(SUM(le.debit) - SUM(le.credit)) > 0.00000001
+       ) x`,
+      [this.environment],
     );
     const ledgerBalanced = Number(ledgerRes.rows[0]?.n ?? 0) === 0;
 
@@ -143,7 +149,8 @@ export class Metrics {
            AVG(profit_usd)::text                         AS avg_profit,
            AVG(actual_latency_s)::text                   AS avg_latency
          FROM learning_events
-         WHERE ts > now() - ($1 || ' days')::interval
+         WHERE environment = $1
+           AND ts > now() - ($2 || ' days')::interval
          GROUP BY task_type
        ),
        dom AS (
@@ -152,7 +159,8 @@ export class Metrics {
            actual_model    AS dominant_model,
            actual_provider AS dominant_provider
          FROM learning_events
-         WHERE ts > now() - ($1 || ' days')::interval
+         WHERE environment = $1
+           AND ts > now() - ($2 || ' days')::interval
          GROUP BY task_type, actual_model, actual_provider
          ORDER BY task_type, COUNT(*) DESC
        )
@@ -167,7 +175,7 @@ export class Metrics {
          dom.dominant_provider
        FROM agg JOIN dom USING (task_type)
        ORDER BY agg.task_type`,
-      [String(windowDays)],
+      [this.environment, String(windowDays)],
     );
 
     return res.rows.map((r) => ({
@@ -199,10 +207,11 @@ export class Metrics {
          AVG(actual_cost_usd)::text             AS avg_cost,
          AVG(actual_latency_s)::text            AS avg_latency
        FROM learning_events
-       WHERE ts > now() - ($1 || ' days')::interval
+       WHERE environment = $1
+         AND ts > now() - ($2 || ' days')::interval
        GROUP BY actual_provider
        ORDER BY COUNT(*) DESC`,
-      [String(windowDays)],
+      [this.environment, String(windowDays)],
     );
 
     return res.rows.map((r) => ({
@@ -232,10 +241,11 @@ export class Metrics {
          SUM(profit_usd)::text                     AS total_profit,
          AVG(time_adjusted_profit)::text           AS avg_tap
        FROM learning_events
-       WHERE ts > now() - ($1 || ' days')::interval
+       WHERE environment = $1
+         AND ts > now() - ($2 || ' days')::interval
        GROUP BY adapter_id
        ORDER BY SUM(profit_usd) DESC`,
-      [String(windowDays)],
+      [this.environment, String(windowDays)],
     );
 
     return res.rows.map((r) => ({
@@ -266,10 +276,11 @@ export class Metrics {
          SUM(profit_usd)::text  AS profit_usd,
          SUM(actual_cost_usd)::text AS cost_usd
        FROM learning_events
-       WHERE ts > now() - ($1 || ' hours')::interval
+       WHERE environment = $1
+         AND ts > now() - ($2 || ' hours')::interval
        GROUP BY 1
        ORDER BY 1 DESC`,
-      [String(windowHours)],
+      [this.environment, String(windowHours)],
     );
 
     return res.rows.map((r) => ({
@@ -285,7 +296,6 @@ export class Metrics {
     const lastHour = await this.overview(1 / 24);
     const last24h = await this.overview(1);
 
-    // Success rate
     if (last24h.totalTasks >= 10 && last24h.successRate < 0.85) {
       alerts.push({
         severity: last24h.successRate < 0.7 ? 'critical' : 'warn',
@@ -296,7 +306,6 @@ export class Metrics {
       });
     }
 
-    // Ledger integrity
     if (!last24h.ledgerBalanced) {
       alerts.push({
         severity: 'critical',
@@ -305,7 +314,6 @@ export class Metrics {
       });
     }
 
-    // No activity
     if (lastHour.totalTasks === 0) {
       alerts.push({
         severity: 'warn',
@@ -314,7 +322,6 @@ export class Metrics {
       });
     }
 
-    // Negative profit
     if (last24h.totalTasks >= 5 && last24h.totalProfitUsd < 0) {
       alerts.push({
         severity: 'critical',
@@ -325,7 +332,6 @@ export class Metrics {
       });
     }
 
-    // Cost spike
     if (last24h.avgCostPerTaskUsd > 0.10) {
       alerts.push({
         severity: 'warn',

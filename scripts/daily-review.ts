@@ -1,16 +1,16 @@
 /**
  * Daily review.
  *
- * Prints an overview of the last 24 hours (or N days).
- *
  * Usage:
  *   pnpm tsx scripts/daily-review.ts
  *   pnpm tsx scripts/daily-review.ts 7
+ *   AGENT_ENVIRONMENT=staging pnpm tsx scripts/daily-review.ts
  */
 
 import 'dotenv/config';
 import { Metrics } from '../src/observability/metrics.js';
 import { closePool } from '../src/persistence/pool.js';
+import { env } from '../src/config/env.js';
 
 function pad(s: string, n: number): string {
   return s.length >= n ? s : s + ' '.repeat(n - s.length);
@@ -21,16 +21,16 @@ function usd(n: number, digits = 4): string {
 
 async function main(): Promise<void> {
   const days = Number(process.argv[2] ?? '1');
-  const m = new Metrics();
+  const m = new Metrics(env.AGENT_ENVIRONMENT);
 
   console.log('');
   console.log('='.repeat(72));
   console.log('  AGENT DAILY REVIEW  —  last ' + days + ' day(s)');
+  console.log('  environment: ' + env.AGENT_ENVIRONMENT);
   console.log('  ' + new Date().toISOString());
   console.log('='.repeat(72));
   console.log('');
 
-  // --- Overview ---
   const o = await m.overview(days);
   console.log('OVERVIEW');
   console.log('  tasks processed:      ' + o.totalTasks);
@@ -44,7 +44,6 @@ async function main(): Promise<void> {
   console.log('  ledger balanced:      ' + (o.ledgerBalanced ? 'YES' : 'NO'));
   console.log('');
 
-  // --- Per task type ---
   const types = await m.perTaskType(Math.max(days, 7));
   if (types.length > 0) {
     console.log('PER TASK TYPE (last 7d)');
@@ -73,7 +72,6 @@ async function main(): Promise<void> {
     console.log('');
   }
 
-  // --- Per provider ---
   const providers = await m.perProvider(Math.max(days, 7));
   if (providers.length > 0) {
     console.log('PER PROVIDER (last 7d)');
@@ -98,7 +96,6 @@ async function main(): Promise<void> {
     console.log('');
   }
 
-  // --- Per adapter ---
   const adapters = await m.perAdapter(Math.max(days, 7));
   if (adapters.length > 0) {
     console.log('PER ADAPTER (last 7d)');
@@ -125,7 +122,6 @@ async function main(): Promise<void> {
     console.log('');
   }
 
-  // --- Alerts ---
   const alerts = await m.alerts();
   if (alerts.length === 0) {
     console.log('ALERTS: none  ✓');
