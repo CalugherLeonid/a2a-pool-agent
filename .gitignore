@@ -40,3 +40,9 @@ okx-state/
 .idea/
 .DS_Store
 Thumbs.db
+
+# One-shot scripts and dumps
+audit_dump.txt
+fix-blocante.mjs
+clustly.yaml
+clustly-agent/

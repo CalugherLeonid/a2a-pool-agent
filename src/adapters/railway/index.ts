@@ -2,8 +2,9 @@
  * Railway adapter.
  *
  * Extends HttpPollAdapter, which provides the resilient polling loop
- * and health tracking. This class wires the pool client to the adapter
- * contract and nothing else.
+ * and health tracking. The adapter receives the agent's Signer at
+ * construction time and uses it to publish the Ed25519 public key
+ * when registering with the pool.
  */
 
 import { HttpPollAdapter } from '../base/http-poll-adapter.js';
@@ -17,6 +18,7 @@ import type {
   SettlementReceipt,
   Terms,
 } from '../../core/types/index.js';
+import type { Signer } from '../../identity/ed25519.js';
 import { env } from '../../config/env.js';
 import { RailwayClient } from './client.js';
 import { mapRailwayTask } from './mapper.js';
@@ -30,6 +32,7 @@ export class RailwayAdapter extends HttpPollAdapter {
 
   constructor(
     config: AdapterConfig,
+    private readonly signer: Signer,
     options: { pollIntervalMs?: number } = {},
   ) {
     super(config, options);
@@ -54,9 +57,15 @@ export class RailwayAdapter extends HttpPollAdapter {
 
     this.client = new RailwayClient(url, workerId);
 
+    const pubkey = this.signer.pubkeyPem();
+    const pubkeyFirstLine = pubkey.split('\n')[0] ?? '';
+
     try {
-      await this.client.register();
-      this.log.info({ url, workerId }, 'registered with Railway pool');
+      await this.client.register(pubkey);
+      this.log.info(
+        { url, workerId, pubkey: pubkeyFirstLine },
+        'registered with Railway pool (pubkey sent)',
+      );
     } catch (err) {
       this.log.warn(
         { err },

@@ -2,7 +2,15 @@
  * Agent Core orchestrator.
  *
  * Owns the end-to-end loop for each adapter:
- *   DISCOVER -> TRIAGE -> ACCEPT -> EXECUTE -> QUALITY -> DELIVER -> SETTLE -> LEARN
+ *   DISCOVER -> TRIAGE -> BUDGET -> ACCEPT -> EXECUTE -> QUALITY
+ *     -> DELIVER (or REJECT on quality failure) -> SETTLE -> LEARN
+ *
+ * Budget is checked AFTER triage and BEFORE accept. If the expected
+ * cost would exceed the daily cap, the task is rejected.
+ *
+ * If quality fails after all retries, the task is rejected — no
+ * delivery, no settlement. The cost is still recorded so the budget
+ * guard and learning store both see it.
  */
 
 import type { MarketplaceAdapter } from '../adapters/adapter.js';
@@ -11,6 +19,7 @@ import type {
   EconomicDecision,
   QualityReport,
   RawTask,
+  SettlementReceipt,
   Sha256Hash,
   Terms,
 } from './types/index.js';
@@ -21,6 +30,7 @@ import type { Executor, ExecutionResult } from './executor.js';
 import type { QualityChecker } from './quality.js';
 import type { Ledger } from './ledger.js';
 import type { LearningStore } from './learning.js';
+import type { BudgetGuard } from './budget.js';
 import { canonicalJson, sha256Hash } from '../identity/ed25519.js';
 import { createLogger, type Logger } from '../observability/logger.js';
 
@@ -35,9 +45,27 @@ export interface AgentCoreDeps {
   quality: QualityChecker;
   ledger: Ledger;
   learning: LearningStore;
+  budget: BudgetGuard;
   agentId: string;
   workerId: string;
 }
+
+type QualityLoopResult =
+  | {
+      kind: 'delivered';
+      execution: ExecutionResult;
+      report: QualityReport;
+      attempts: number;
+      totalCostUsd: number;
+      totalLatencyMs: number;
+    }
+  | {
+      kind: 'failed';
+      report: QualityReport;
+      attempts: number;
+      totalCostUsd: number;
+      totalLatencyMs: number;
+    };
 
 export class AgentCore {
   private readonly log = createLogger('agent');
@@ -55,6 +83,10 @@ export class AgentCore {
     this.log.info(
       { adapters: adapters.map((a) => a.id) },
       'agent core started',
+    );
+    this.log.info(
+      { usedUsd: this.deps.budget.used, capUsd: this.deps.budget.cap },
+      'budget state at startup',
     );
 
     await Promise.all(adapters.map((a) => this.runAdapter(a)));
@@ -116,9 +148,29 @@ export class AgentCore {
       return;
     }
 
+    // --- BUDGET GUARD (hard gate, before accept) ---
+    const estCost = decision.components.expectedTotalCostUsd;
+    if (this.deps.budget.wouldExceed(estCost)) {
+      const reason =
+        'daily_budget_exceeded:used=' +
+        this.deps.budget.used.toFixed(6) +
+        ':cap=' +
+        this.deps.budget.cap.toFixed(6);
+      taskLog.warn(
+        {
+          usedUsd: this.deps.budget.used,
+          capUsd: this.deps.budget.cap,
+          estCost,
+        },
+        'rejected by budget guard',
+      );
+      await adapter.reject(rawTask.id, reason);
+      return;
+    }
+
     const maxRetries = 1;
     const terms: Terms = {
-      estimatedCostUsd: decision.components.expectedTotalCostUsd,
+      estimatedCostUsd: estCost,
       estimatedTimeS: 30,
       model: decision.model,
       confidence: decision.confidence,
@@ -140,6 +192,48 @@ export class AgentCore {
       maxRetries,
       taskLog,
     );
+
+    // Record cost regardless of outcome so the budget guard stays honest.
+    this.deps.budget.record(loop.totalCostUsd);
+
+    // --- QUALITY FAILED: reject, do not deliver ---
+    if (loop.kind === 'failed') {
+      taskLog.error(
+        {
+          reason: loop.report.reason,
+          score: loop.report.score,
+          attempts: loop.attempts,
+          totalCostUsd: loop.totalCostUsd,
+        },
+        'quality failed after retries — rejecting task (no delivery, no settlement)',
+      );
+
+      try {
+        await adapter.reject(
+          rawTask.id,
+          'quality_failed:' + loop.report.reason,
+        );
+      } catch (err) {
+        taskLog.error({ err }, 'reject call failed');
+      }
+
+      try {
+        await this.recordLearning({
+          rawTask,
+          adapter,
+          decision,
+          execution: undefined,
+          report: loop.report,
+          totalCostUsd: loop.totalCostUsd,
+          totalLatencyMs: loop.totalLatencyMs,
+          success: false,
+          receipt: undefined,
+        });
+      } catch (err) {
+        taskLog.error({ err }, 'learning event record failed');
+      }
+      return;
+    }
 
     // --- BUILD + SIGN DELIVERY ---
     const canonical = canonicalJson(loop.execution.output);
@@ -198,59 +292,98 @@ export class AgentCore {
 
     // --- LEARNING ---
     try {
-      const predictedLatencyS = 30;
-      const actualLatencyS = loop.totalLatencyMs / 1000;
-      const revenueUsd = receipt.amountUsd;
-      const profitUsd =
-        revenueUsd -
-        receipt.platformFeeAmount -
-        loop.totalCostUsd;
-      const settlementDelayH = Math.max(
-        adapter.capabilities().limits.averageSettlementDelayHours,
-        this.deps.delayFloorHours,
-      );
-      const totalTimeH = actualLatencyS / 3600 + settlementDelayH;
-      const timeAdjustedProfit = profitUsd / Math.max(totalTimeH, 1e-6);
-
-      await this.deps.learning.record({
-        id: rawTask.id, // LearningEvent.id will be regenerated by DB
-        agentId: this.deps.agentId,
-        taskId: rawTask.id,
-        adapterId: adapter.id,
-        taskType: rawTask.type,
-        strategyId: decision.strategyId,
-        predicted: {
-          costUsd: decision.components.expectedTotalCostUsd,
-          latencyS: predictedLatencyS,
-          successProb: decision.successProbability,
-          quality: 1,
-          model: decision.model,
-          settlementDelayH,
-        },
-        actual: {
-          costUsd: loop.totalCostUsd,
-          latencyS: actualLatencyS,
-          success: loop.report.decision === 'deliver',
-          quality: loop.report.score,
-          model: loop.execution.model,
-          provider: loop.execution.provider,
-          settlementDelayH,
-          platformFeeUsd: receipt.platformFeeAmount,
-          gasCostUsd: 0,
-        },
-        budgetContext: {
-          dailyUsed: 0,
-          dailyCap: 0,
-        },
-        revenueUsd,
-        profitUsd,
-        timeAdjustedProfit,
-        clientFeedback: receipt.status === 'settled' ? 'accepted' : undefined,
-        ts: new Date().toISOString(),
+      await this.recordLearning({
+        rawTask,
+        adapter,
+        decision,
+        execution: loop.execution,
+        report: loop.report,
+        totalCostUsd: loop.totalCostUsd,
+        totalLatencyMs: loop.totalLatencyMs,
+        success: true,
+        receipt,
       });
     } catch (err) {
       taskLog.error({ err }, 'learning event record failed');
     }
+  }
+
+  private async recordLearning(args: {
+    rawTask: RawTask;
+    adapter: MarketplaceAdapter;
+    decision: EconomicDecision;
+    execution: ExecutionResult | undefined;
+    report: QualityReport;
+    totalCostUsd: number;
+    totalLatencyMs: number;
+    success: boolean;
+    receipt: SettlementReceipt | undefined;
+  }): Promise<void> {
+    const {
+      rawTask,
+      adapter,
+      decision,
+      execution,
+      report,
+      totalCostUsd,
+      totalLatencyMs,
+      success,
+      receipt,
+    } = args;
+
+    const predictedLatencyS = 30;
+    const actualLatencyS = totalLatencyMs / 1000;
+    const revenueUsd = receipt?.amountUsd ?? 0;
+    const platformFeeUsd = receipt?.platformFeeAmount ?? 0;
+    const profitUsd = success
+      ? revenueUsd - platformFeeUsd - totalCostUsd
+      : -totalCostUsd;
+
+    const settlementDelayH = Math.max(
+      adapter.capabilities().limits.averageSettlementDelayHours,
+      this.deps.delayFloorHours,
+    );
+    const totalTimeH = actualLatencyS / 3600 + settlementDelayH;
+    const timeAdjustedProfit = profitUsd / Math.max(totalTimeH, 1e-6);
+
+    await this.deps.learning.record({
+      id: rawTask.id,
+      agentId: this.deps.agentId,
+      taskId: rawTask.id,
+      adapterId: adapter.id,
+      taskType: rawTask.type,
+      strategyId: decision.strategyId,
+      predicted: {
+        costUsd: decision.components.expectedTotalCostUsd,
+        latencyS: predictedLatencyS,
+        successProb: decision.successProbability,
+        quality: 1,
+        model: decision.model,
+        settlementDelayH,
+      },
+      actual: {
+        costUsd: totalCostUsd,
+        latencyS: actualLatencyS,
+        success,
+        quality: report.score,
+        model: execution?.model ?? 'none',
+        provider: execution?.provider ?? 'google',
+        settlementDelayH,
+        platformFeeUsd,
+        gasCostUsd: 0,
+      },
+      budgetContext: this.deps.budget.snapshot(),
+      revenueUsd,
+      profitUsd,
+      timeAdjustedProfit,
+      errorKind: success ? undefined : report.reason,
+      clientFeedback: success
+        ? receipt?.status === 'settled'
+          ? 'accepted'
+          : undefined
+        : 'rejected',
+      ts: new Date().toISOString(),
+    });
   }
 
   private async executeWithQuality(
@@ -258,16 +391,9 @@ export class AgentCore {
     decision: EconomicDecision,
     maxRetries: number,
     taskLog: Logger,
-  ): Promise<{
-    execution: ExecutionResult;
-    report: QualityReport;
-    attempts: number;
-    totalCostUsd: number;
-    totalLatencyMs: number;
-  }> {
+  ): Promise<QualityLoopResult> {
     let attempt = 0;
     let previousError: string | undefined;
-    let lastExecution: ExecutionResult | undefined;
     let lastReport: QualityReport | undefined;
 
     let totalCostUsd = 0;
@@ -284,7 +410,6 @@ export class AgentCore {
 
       totalCostUsd += execution.costUsd;
       totalLatencyMs += execution.latencyMs;
-      lastExecution = execution;
 
       taskLog.info(
         {
@@ -321,6 +446,7 @@ export class AgentCore {
 
       if (report.decision === 'deliver') {
         return {
+          kind: 'delivered',
           execution,
           report,
           attempts: attempt + 1,
@@ -330,12 +456,8 @@ export class AgentCore {
       }
 
       if (report.decision === 'fail') {
-        taskLog.warn(
-          { reason: report.reason },
-          'quality failed with no retries left, delivering with low score',
-        );
         return {
-          execution,
+          kind: 'failed',
           report,
           attempts: attempt + 1,
           totalCostUsd,
@@ -348,8 +470,9 @@ export class AgentCore {
       taskLog.info({ nextAttempt: attempt }, 'retrying execution');
     }
 
+    // Unreachable in practice — quality returns one of the three decisions.
     return {
-      execution: lastExecution!,
+      kind: 'failed',
       report: lastReport!,
       attempts: attempt,
       totalCostUsd,

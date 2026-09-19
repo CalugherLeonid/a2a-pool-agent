@@ -1,5 +1,9 @@
 /**
  * Learning store.
+ *
+ * Every row is tagged with the agent's current environment. Queries
+ * filter by it, so simulation data never contaminates production
+ * learning and vice versa.
  */
 
 import { query } from '../persistence/pool.js';
@@ -44,9 +48,12 @@ export interface CalibrationStats {
 }
 
 export class LearningStore {
+  constructor(private readonly environment: string) {}
+
   async record(event: LearningEvent): Promise<void> {
     await query(
       `INSERT INTO learning_events (
+        environment,
         agent_id, task_id, adapter_id, task_type, strategy_id,
         predicted_cost_usd, predicted_latency_s, predicted_success_prob,
         predicted_quality, predicted_model, predicted_settlement_delay_h,
@@ -57,13 +64,15 @@ export class LearningStore {
         revenue_usd, profit_usd, time_adjusted_profit,
         error_kind, client_feedback
       ) VALUES (
-        $1,$2,$3,$4,$5,
-        $6,$7,$8,$9,$10,$11,
-        $12,$13,$14,$15,$16,$17,$18,$19,$20,
-        $21,$22,$23,$24,$25,
-        $26,$27
+        $1,
+        $2,$3,$4,$5,$6,
+        $7,$8,$9,$10,$11,$12,
+        $13,$14,$15,$16,$17,$18,$19,$20,$21,
+        $22,$23,$24,$25,$26,
+        $27,$28
       )`,
       [
+        this.environment,
         event.agentId, event.taskId, event.adapterId, event.taskType,
         event.strategyId,
         event.predicted.costUsd.toFixed(8),
@@ -93,16 +102,31 @@ export class LearningStore {
 
     log.info(
       {
+        environment: this.environment,
         taskId: event.taskId,
         taskType: event.taskType,
         adapterId: event.adapterId,
         model: event.actual.model,
         provider: event.actual.provider,
+        success: event.actual.success,
         profitUsd: event.profitUsd,
         timeAdjustedProfit: event.timeAdjustedProfit,
       },
       'learning event recorded',
     );
+  }
+
+  /** Sum of actual execution cost recorded today (UTC). Used by
+   *  BudgetGuard to hydrate its state at startup. */
+  async costToday(): Promise<number> {
+    const res = await query<{ sum: string }>(
+      `SELECT COALESCE(SUM(actual_cost_usd), 0)::text AS sum
+       FROM learning_events
+       WHERE environment = $1
+         AND ts >= date_trunc('day', now() AT TIME ZONE 'UTC')`,
+      [this.environment],
+    );
+    return Number(res.rows[0]?.sum ?? 0);
   }
 
   async bestModel(
@@ -129,13 +153,14 @@ export class LearningStore {
          AVG(actual_latency_s)::text       AS avg_latency,
          COUNT(*)::text                    AS n
        FROM learning_events
-       WHERE task_type = $1
-         AND adapter_id = $2
-         AND ts > now() - ($3 || ' days')::interval
+       WHERE environment = $1
+         AND task_type = $2
+         AND adapter_id = $3
+         AND ts > now() - ($4 || ' days')::interval
        GROUP BY actual_model, actual_provider
-       HAVING COUNT(*) >= $4
+       HAVING COUNT(*) >= $5
        ORDER BY AVG(actual_success::int) DESC, AVG(actual_cost_usd) ASC`,
-      [taskType, adapterId, String(windowDays), minSamples],
+      [this.environment, taskType, adapterId, String(windowDays), minSamples],
     );
 
     return res.rows.map((r) => ({
@@ -166,12 +191,13 @@ export class LearningStore {
          AVG(time_adjusted_profit)::text  AS avg_tap,
          COUNT(*)::text                   AS n
        FROM learning_events
-       WHERE task_type = $1
-         AND ts > now() - ($2 || ' days')::interval
+       WHERE environment = $1
+         AND task_type = $2
+         AND ts > now() - ($3 || ' days')::interval
        GROUP BY adapter_id
-       HAVING COUNT(*) >= $3
+       HAVING COUNT(*) >= $4
        ORDER BY AVG(time_adjusted_profit) DESC`,
-      [taskType, String(windowDays), minSamples],
+      [this.environment, taskType, String(windowDays), minSamples],
     );
 
     return res.rows.map((r) => ({
@@ -193,11 +219,12 @@ export class LearningStore {
          AVG(actual_success::int)::text AS success_rate,
          COUNT(*)::text                 AS n
        FROM learning_events
-       WHERE task_type = $1
-         AND adapter_id = $2
-         AND ts > now() - ($3 || ' days')::interval
-       HAVING COUNT(*) >= $4`,
-      [taskType, adapterId, String(windowDays), minSamples],
+       WHERE environment = $1
+         AND task_type = $2
+         AND adapter_id = $3
+         AND ts > now() - ($4 || ' days')::interval
+       HAVING COUNT(*) >= $5`,
+      [this.environment, taskType, adapterId, String(windowDays), minSamples],
     );
 
     if (res.rows.length === 0) return null;
@@ -219,11 +246,12 @@ export class LearningStore {
          AVG(actual_cost_usd)::text AS avg_cost,
          COUNT(*)::text             AS n
        FROM learning_events
-       WHERE task_type = $1
-         AND adapter_id = $2
-         AND ts > now() - ($3 || ' days')::interval
-       HAVING COUNT(*) >= $4`,
-      [taskType, adapterId, String(windowDays), minSamples],
+       WHERE environment = $1
+         AND task_type = $2
+         AND adapter_id = $3
+         AND ts > now() - ($4 || ' days')::interval
+       HAVING COUNT(*) >= $5`,
+      [this.environment, taskType, adapterId, String(windowDays), minSamples],
     );
 
     if (res.rows.length === 0) return null;
@@ -252,10 +280,11 @@ export class LearningStore {
          AVG(predicted_latency_s - actual_latency_s)::text  AS latency_bias,
          COUNT(*)::text                                     AS n
        FROM learning_events
-       WHERE ts > now() - ($1 || ' days')::interval
+       WHERE environment = $1
+         AND ts > now() - ($2 || ' days')::interval
        GROUP BY task_type
-       HAVING COUNT(*) >= $2`,
-      [String(windowDays), minSamples],
+       HAVING COUNT(*) >= $3`,
+      [this.environment, String(windowDays), minSamples],
     );
 
     return res.rows.map((r) => ({
@@ -269,7 +298,8 @@ export class LearningStore {
 
   async count(): Promise<number> {
     const res = await query<{ n: string }>(
-      'SELECT COUNT(*)::text AS n FROM learning_events',
+      `SELECT COUNT(*)::text AS n FROM learning_events WHERE environment = $1`,
+      [this.environment],
     );
     return Number(res.rows[0]?.n ?? 0);
   }

@@ -8,7 +8,7 @@
   "estimated_gas_cost_usd": 0,
   "delay_floor_hours": 0.25,
   "model_router": {
-    "mode": "hybrid",
+    "mode": "fixed",
     "fixed_model": "gemini-3.5-flash-lite",
     "min_samples_for_learning": 20
   },

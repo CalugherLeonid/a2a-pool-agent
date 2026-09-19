@@ -4,8 +4,8 @@
  * Validates all env vars against a zod schema at startup. Fails fast with
  * a human-readable error if anything is missing or malformed.
  *
- * Empty strings are treated as `undefined` so that `.optional()` works
- * as expected with placeholder entries in `.env`.
+ * Empty strings are treated as \`undefined\` so that \`.optional()\` works
+ * as expected with placeholder entries in \`.env\`.
  */
 
 import 'dotenv/config';
@@ -17,6 +17,13 @@ const EnvSchema = z.object({
   AGENT_NAME: z.string().min(1),
   AGENT_ED25519_KEY_PATH: z.string().min(1),
   AGENT_SOLANA_KEY_PATH: z.string().min(1).optional(),
+
+  /** Which set of learning events this agent instance is allowed to
+   *  read/write. Prevents simulation data from contaminating real
+   *  learning, and vice versa. */
+  AGENT_ENVIRONMENT: z
+    .enum(['development', 'staging', 'production'])
+    .default('development'),
 
   // --- Database ---------------------------------------------------
   DATABASE_URL: z.string().url(),

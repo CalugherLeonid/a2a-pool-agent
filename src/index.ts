@@ -1,7 +1,13 @@
 /**
  * Entrypoint.
  *
- * F1 - Paso 10: learning-backed providers + model router + delay floor.
+ * Wires everything together:
+ *   - Signer (Ed25519 identity)
+ *   - Economics config (thresholds, delay floor, model router)
+ *   - Adapter registry (railway receives the signer for pubkey publish)
+ *   - Learning store (scoped by AGENT_ENVIRONMENT)
+ *   - Budget guard (hydrated from today's learning events)
+ *   - Agent Core (orchestrator)
  */
 
 import { env } from './config/env.js';
@@ -17,9 +23,13 @@ import { StubExecutor } from './core/stub-executor.js';
 import { QualityChecker } from './core/quality.js';
 import { Ledger } from './core/ledger.js';
 import { LearningStore } from './core/learning.js';
-import { LearningBackedSuccessProbabilityProvider, LearningBackedCostEstimator } from './core/learning-providers.js';
+import { BudgetGuard } from './core/budget.js';
+import {
+  LearningBackedSuccessProbabilityProvider,
+  LearningBackedCostEstimator,
+} from './core/learning-providers.js';
 import { createModelRouter } from './core/model-router.js';
-import { loadSignerFromPemPath } from './identity/ed25519.js';
+import { loadSignerFromPemPath, type Signer } from './identity/ed25519.js';
 import { closePool } from './persistence/pool.js';
 
 const log = createLogger('main');
@@ -61,11 +71,13 @@ async function main(): Promise<void> {
       agentId: env.AGENT_ID,
       agentName: env.AGENT_NAME,
       nodeEnv: env.NODE_ENV,
+      agentEnvironment: env.AGENT_ENVIRONMENT,
     },
     'a2a-pool-agent starting',
   );
 
-  let signer;
+  // --- Signing key ---
+  let signer: Signer;
   try {
     signer = loadSignerFromPemPath(env.AGENT_ED25519_KEY_PATH);
   } catch (err) {
@@ -77,6 +89,7 @@ async function main(): Promise<void> {
   }
   log.info({ pubkey: signer.pubkeyPem().split('\n')[0] }, 'signer loaded');
 
+  // --- Economics ---
   const economics = loadEconomics();
   log.info(
     {
@@ -88,11 +101,14 @@ async function main(): Promise<void> {
     'economics loaded',
   );
 
+  // --- Adapter registry ---
   const registry = new AdapterRegistry();
   registry.registerFactory(
     'railway',
     (config) =>
-      new RailwayAdapter(config, { pollIntervalMs: env.POLL_INTERVAL_MS }),
+      new RailwayAdapter(config, signer, {
+        pollIntervalMs: env.POLL_INTERVAL_MS,
+      }),
   );
   registry.registerFactory(
     'mock',
@@ -109,8 +125,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  // --- Learning store (created first; used by providers + router) ---
-  const learning = new LearningStore();
+  // --- Learning store (scoped by environment) ---
+  const learning = new LearningStore(env.AGENT_ENVIRONMENT);
 
   // --- Model router ---
   const modelRouter = createModelRouter({
@@ -148,10 +164,18 @@ async function main(): Promise<void> {
     delayFloorHours: economics.delay_floor_hours,
   });
 
+  // --- Budget guard (hard gate) ---
+  const budget = new BudgetGuard({
+    dailyCapUsd: env.DAILY_BUDGET_USD,
+    store: learning,
+  });
+  await budget.hydrate();
+
   const executor = pickExecutor();
   const quality = new QualityChecker();
   const ledger = new Ledger();
 
+  // --- Agent Core ---
   const core = new AgentCore({
     registry,
     signer,
@@ -160,9 +184,10 @@ async function main(): Promise<void> {
     quality,
     ledger,
     learning,
+    budget,
     agentId: env.AGENT_ID,
-    delayFloorHours: economics.delay_floor_hours,
     workerId: env.AGENT_NAME,
+    delayFloorHours: economics.delay_floor_hours,
   });
 
   const shutdown = async (signal: string): Promise<void> => {
