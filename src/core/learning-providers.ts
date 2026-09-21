@@ -55,9 +55,17 @@ export class LearningBackedCostEstimator implements CostEstimator {
     }
 
     const avg = stats.avgCost;
+    // R6: Scale historical average by task complexity (0.0 to 1.0, baseline 0.5)
+    const clampedComplexity = Math.max(0, Math.min(1, complexity));
+    const complexityMultiplier = 0.7 + 0.6 * clampedComplexity;
+    const estimatedUsd = avg * complexityMultiplier;
+
     return {
-      estimatedUsd: avg,
-      profile: { typicalUsd: avg, worstCaseUsd: avg * 2 },
+      estimatedUsd,
+      profile: {
+        typicalUsd: estimatedUsd,
+        worstCaseUsd: estimatedUsd * (clampedComplexity > 0.7 ? 2.2 : 1.8),
+      },
       source: 'learning',
     };
   }

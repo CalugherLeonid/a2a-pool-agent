@@ -311,4 +311,86 @@ export class Ledger {
     );
     return Number(res.rows[0]?.profit ?? 0);
   }
+
+  /** All accounts with debits, credits, and net balances. */
+  async getAccountBalances(): Promise<Array<{
+    code: string;
+    name: string;
+    type: string;
+    currency: string;
+    totalDebit: number;
+    totalCredit: number;
+    balance: number;
+  }>> {
+    const res = await query<{
+      code: string;
+      name: string;
+      type: string;
+      currency: string;
+      total_debit: string;
+      total_credit: string;
+    }>(
+      `SELECT a.code, a.name, a.type, a.currency,
+              COALESCE(SUM(le.debit), 0)::text AS total_debit,
+              COALESCE(SUM(le.credit), 0)::text AS total_credit
+       FROM accounts a
+       LEFT JOIN ledger_entries le ON le.account_id = a.id
+       GROUP BY a.id, a.code, a.name, a.type, a.currency
+       ORDER BY a.code`,
+    );
+    return res.rows.map((r) => {
+      const d = Number(r.total_debit);
+      const c = Number(r.total_credit);
+      const isAssetOrExp = r.type === 'asset' || r.type === 'expense';
+      const balance = isAssetOrExp ? d - c : c - d;
+      return {
+        code: r.code,
+        name: r.name,
+        type: r.type,
+        currency: r.currency,
+        totalDebit: d,
+        totalCredit: c,
+        balance,
+      };
+    });
+  }
+
+  /** Recent settled transactions with aggregated entries. */
+  async getRecentTransactions(limit = 20): Promise<Array<{
+    id: string;
+    task_id: string;
+    adapter_id: string;
+    description: string;
+    status: string;
+    created_at: string;
+    settled_at: string | null;
+    entries?: Array<{ accountCode: string; accountName: string; debit: number; credit: number }>;
+  }>> {
+    const res = await query<{
+      id: string;
+      task_id: string;
+      adapter_id: string;
+      description: string;
+      status: string;
+      created_at: string;
+      settled_at: string | null;
+      entries: Array<{ accountCode: string; accountName: string; debit: number; credit: number }>;
+    }>(
+      `SELECT t.id, t.task_id, t.adapter_id, t.description, t.status, t.created_at::text, t.settled_at::text,
+              json_agg(json_build_object(
+                'accountCode', a.code,
+                'accountName', a.name,
+                'debit', le.debit,
+                'credit', le.credit
+              )) AS entries
+       FROM transactions t
+       JOIN ledger_entries le ON le.transaction_id = t.id
+       JOIN accounts a ON a.id = le.account_id
+       GROUP BY t.id
+       ORDER BY t.created_at DESC
+       LIMIT $1`,
+      [limit],
+    );
+    return res.rows;
+  }
 }

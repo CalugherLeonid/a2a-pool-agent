@@ -5,7 +5,8 @@
  *   pnpm db:ping
  */
 
-import 'dotenv/config';
+import dotenv from 'dotenv';
+dotenv.config({ override: true });
 import { Client } from 'pg';
 
 async function main(): Promise<void> {

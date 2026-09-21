@@ -47,6 +47,10 @@ export abstract class HttpPollAdapter implements MarketplaceAdapter {
   private lastError?: string;
   private backoffMs = BASE_BACKOFF_MS;
 
+  /** Sliding cache of seen task IDs to avoid processing duplicate tasks across poll cycles (R-REG-2) */
+  private readonly seenTaskIds = new Map<string, number>();
+  private readonly seenTtlMs = 15 * 60 * 1000; // 15 minutes TTL
+
   constructor(
     protected readonly config: AdapterConfig,
     options: { pollIntervalMs?: number } = {},
@@ -109,8 +113,27 @@ export abstract class HttpPollAdapter implements MarketplaceAdapter {
           const tasks = await this.fetchTasks();
           this.backoffMs = BASE_BACKOFF_MS;
 
+          // Evict stale tasks from seen map
+          const now = Date.now();
+          if (this.seenTaskIds.size > 2000) {
+            for (const [id, seenAt] of this.seenTaskIds.entries()) {
+              if (now - seenAt > this.seenTtlMs) {
+                this.seenTaskIds.delete(id);
+              }
+            }
+          }
+
           for (const task of tasks) {
             if (!this.running) return;
+
+            // Skip if task was already seen recently
+            const seenAt = this.seenTaskIds.get(task.id);
+            if (seenAt && now - seenAt < this.seenTtlMs) {
+              this.log.debug({ taskId: task.id }, 'skipping duplicate task in poll');
+              continue;
+            }
+
+            this.seenTaskIds.set(task.id, now);
             yield task;
           }
         } catch (err) {

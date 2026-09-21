@@ -5,7 +5,8 @@
  *   pnpm migrate
  */
 
-import 'dotenv/config';
+import dotenv from 'dotenv';
+dotenv.config({ override: true });
 import { runMigrations } from '../src/persistence/migrate.js';
 import { closePool } from '../src/persistence/pool.js';
 

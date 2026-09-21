@@ -1,0 +1,6 @@
+{
+  "name": "A2A Pool Agent",
+  "description": "Multi-marketplace autonomous agent for the A2A pool ecosystem with automated triage, economics, double-entry ledger, learning loop, and live operations dashboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

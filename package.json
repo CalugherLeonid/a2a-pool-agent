@@ -5,13 +5,13 @@
   "type": "module",
   "description": "Multi-marketplace autonomous agent for the A2A pool ecosystem",
   "engines": {
-    "node": ">=22.0.0",
-    "pnpm": ">=9.0.0"
+    "node": ">=22.0.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
+    "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -21,11 +21,13 @@
   "dependencies": {
     "decimal.js": "^10.4.3",
     "dotenv": "^16.4.5",
+    "express": "^5.2.1",
     "pg": "^8.13.0",
     "pino": "^9.4.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^22.7.0",
     "@types/pg": "^8.11.10",
     "pino-pretty": "^11.3.0",

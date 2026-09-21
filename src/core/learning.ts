@@ -159,7 +159,7 @@ export class LearningStore {
          AND ts > now() - ($4 || ' days')::interval
        GROUP BY actual_model, actual_provider
        HAVING COUNT(*) >= $5
-       ORDER BY AVG(actual_success::int) DESC, AVG(actual_cost_usd) ASC`,
+       ORDER BY AVG(actual_success::int) DESC, AVG(actual_quality) DESC, AVG(actual_cost_usd) ASC, AVG(actual_latency_s) ASC`,
       [this.environment, taskType, adapterId, String(windowDays), minSamples],
     );
 
@@ -302,5 +302,44 @@ export class LearningStore {
       [this.environment],
     );
     return Number(res.rows[0]?.n ?? 0);
+  }
+
+  async recentEvents(limit = 20): Promise<Array<{
+    id: string;
+    task_id: string;
+    task_type: string;
+    actual_model: string;
+    actual_cost_usd: number;
+    profit_usd: number;
+    actual_success: boolean;
+    ts: Date | string;
+  }>> {
+    const res = await query<{
+      id: string;
+      task_id: string;
+      task_type: string;
+      actual_model: string;
+      actual_cost_usd: string;
+      profit_usd: string;
+      actual_success: boolean;
+      ts: string;
+    }>(
+      `SELECT id, task_id, task_type, actual_model, actual_cost_usd::text, profit_usd::text, actual_success, ts
+       FROM learning_events
+       WHERE environment = $1
+       ORDER BY ts DESC
+       LIMIT $2`,
+      [this.environment, limit],
+    );
+    return res.rows.map((r) => ({
+      id: r.id,
+      task_id: r.task_id,
+      task_type: r.task_type,
+      actual_model: r.actual_model,
+      actual_cost_usd: Number(r.actual_cost_usd),
+      profit_usd: Number(r.profit_usd),
+      actual_success: Boolean(r.actual_success),
+      ts: r.ts,
+    }));
   }
 }

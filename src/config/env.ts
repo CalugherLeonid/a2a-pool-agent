@@ -8,14 +8,15 @@
  * as expected with placeholder entries in \`.env\`.
  */
 
-import 'dotenv/config';
+import dotenv from 'dotenv';
+dotenv.config({ override: true });
 import { z } from 'zod';
 
 const EnvSchema = z.object({
   // --- Agent Identity ---------------------------------------------
-  AGENT_ID: z.string().uuid(),
-  AGENT_NAME: z.string().min(1),
-  AGENT_ED25519_KEY_PATH: z.string().min(1),
+  AGENT_ID: z.string().uuid().default('00000000-0000-0000-0000-000000000000'),
+  AGENT_NAME: z.string().min(1).default('agent-001'),
+  AGENT_ED25519_KEY_PATH: z.string().min(1).default('./keys/agent.key'),
   AGENT_SOLANA_KEY_PATH: z.string().min(1).optional(),
 
   /** Which set of learning events this agent instance is allowed to
@@ -26,7 +27,10 @@ const EnvSchema = z.object({
     .default('development'),
 
   // --- Database ---------------------------------------------------
-  DATABASE_URL: z.string().url(),
+  DATABASE_URL: z
+    .string()
+    .url()
+    .default('postgresql://mock:mock@localhost:5432/mock_a2a'),
 
   // --- LLM Providers ----------------------------------------------
   GEMINI_API_KEY: z.string().min(1).optional(),

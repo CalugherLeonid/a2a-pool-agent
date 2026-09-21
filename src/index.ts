@@ -31,6 +31,7 @@ import {
 import { createModelRouter } from './core/model-router.js';
 import { loadSignerFromPemPath, type Signer } from './identity/ed25519.js';
 import { closePool } from './persistence/pool.js';
+import { createDashboardServer } from './server/dashboard.js';
 
 const log = createLogger('main');
 
@@ -190,8 +191,21 @@ async function main(): Promise<void> {
     delayFloorHours: economics.delay_floor_hours,
   });
 
+  // --- Dashboard HTTP Server (Port 3000) ---
+  const startTime = new Date();
+  const server = createDashboardServer({
+    signer,
+    registry,
+    budget,
+    ledger,
+    learning,
+    economics,
+    startTime,
+  });
+
   const shutdown = async (signal: string): Promise<void> => {
     log.info({ signal }, 'shutdown signal received');
+    server.close();
     await core.stop();
     await closePool();
     process.exit(0);

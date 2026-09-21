@@ -14,9 +14,11 @@ import {
   createHash,
   createPrivateKey,
   createPublicKey,
+  generateKeyPairSync,
   sign as cryptoSign,
 } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import type { Ed25519Sig, Sha256Hash } from '../core/types/index.js';
 
 export interface Signer {
@@ -26,9 +28,21 @@ export interface Signer {
   pubkeyPem(): string;
 }
 
-/** Load an Ed25519 private key from a PKCS#8 PEM file. */
+/** Load an Ed25519 private key from a PKCS#8 PEM file, or generate one if missing. */
 export function loadSignerFromPemPath(path: string): Signer {
-  const pem = readFileSync(path, 'utf8');
+  let pem: string;
+  if (!existsSync(path)) {
+    mkdirSync(dirname(resolve(path)), { recursive: true });
+    const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+    pem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
+    const pubPem = publicKey.export({ type: 'spki', format: 'pem' }) as string;
+    writeFileSync(path, pem, { encoding: 'utf8' });
+    const pubPath = path.replace(/\.key$/, '.pub');
+    writeFileSync(pubPath, pubPem, { encoding: 'utf8' });
+  } else {
+    pem = readFileSync(path, 'utf8');
+  }
+
   const privateKey = createPrivateKey(pem);
   const publicKey = createPublicKey(privateKey);
 
