@@ -41,3 +41,5 @@ export class TelemetryCollector {
     ].join('\n');
   }
 }
+
+export const globalTelemetry = new TelemetryCollector();

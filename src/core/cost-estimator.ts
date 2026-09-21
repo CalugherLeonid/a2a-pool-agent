@@ -97,3 +97,51 @@ export class LearningCostEstimator implements CostEstimator {
     };
   }
 }
+
+/**
+ * Calculates execution cost in USD based on actual token usage and model/provider.
+ */
+export function calculateTokenCostUsd(
+  model: string,
+  tokensIn: number,
+  tokensOut: number,
+  provider?: string,
+): number {
+  const m = (model ?? '').toLowerCase();
+  const p = (provider ?? '').toLowerCase();
+
+  let rates = { in: 0.15, out: 0.60 }; // default conservative rates
+
+  if (p === 'google' || p === 'gemini' || m.startsWith('gemini')) {
+    if (m.includes('pro')) {
+      rates = { in: 1.25, out: 5.00 };
+    } else {
+      rates = { in: 0.075, out: 0.30 };
+    }
+  } else if (p === 'groq' || m.includes('groq')) {
+    if (m.includes('8b')) {
+      rates = { in: 0.05, out: 0.08 };
+    } else {
+      rates = { in: 0.59, out: 0.79 };
+    }
+  } else if (p === 'openrouter' || m.includes('openrouter')) {
+    if (m.includes(':free') || m.includes('/free')) {
+      rates = { in: 0, out: 0 };
+    } else if (m.includes('deepseek')) {
+      rates = { in: 0.14, out: 0.28 };
+    } else if (m.includes('gemini')) {
+      rates = { in: 0.075, out: 0.30 };
+    } else if (m.includes('llama')) {
+      rates = { in: 0.35, out: 0.40 };
+    } else {
+      rates = { in: 0.50, out: 1.50 };
+    }
+  } else if (m.includes('deepseek')) {
+    rates = { in: 0.14, out: 0.28 };
+  } else if (m.includes('claude') || p === 'anthropic') {
+    rates = { in: 3.0, out: 15.0 };
+  }
+
+  const cost = (tokensIn / 1_000_000) * rates.in + (tokensOut / 1_000_000) * rates.out;
+  return Number(cost.toFixed(6));
+}

@@ -25,6 +25,7 @@ export class StubExecutor implements Executor {
     return {
       output,
       model: 'stub-model',
+      modelUsed: 'stub-model',
       provider: 'groq',
       tokensIn: 0,
       tokensOut: 0,

@@ -15,9 +15,19 @@ import { LlmError } from './llm/types.js';
 import { callGemini, type GeminiConfig } from './llm/gemini.js';
 import { callGroq, type GroqConfig } from './llm/groq.js';
 import { callOpenRouter, type OpenRouterConfig } from './llm/openrouter.js';
+import { RateLimiter } from './resilience/rate-limiter.js';
+import { globalTelemetry, type TelemetryCollector } from '../telemetry/metrics.js';
+import { calculateTokenCostUsd } from './cost-estimator.js';
 import { createLogger } from '../observability/logger.js';
 
 const log = createLogger('executor');
+
+export class RateLimitExceededError extends Error {
+  constructor(message = 'Rate limit exceeded: No tokens available in bucket') {
+    super(message);
+    this.name = 'RateLimitExceededError';
+  }
+}
 
 export interface ExecutionInput {
   task: RawTask;
@@ -30,6 +40,7 @@ export interface ExecutionInput {
 export interface ExecutionResult {
   output: unknown;
   model: string;
+  modelUsed: string;
   provider: LlmProvider;
   tokensIn: number;
   tokensOut: number;
@@ -46,6 +57,9 @@ export interface LlmExecutorDeps {
   gemini?: GeminiConfig;
   groq?: GroqConfig;
   openrouter?: OpenRouterConfig;
+  rateLimiter?: RateLimiter;
+  telemetry?: TelemetryCollector;
+  rateLimitTimeoutMs?: number;
 }
 
 function buildMessages(task: RawTask, input: ExecutionInput): ChatMessage[] {
@@ -115,46 +129,36 @@ export function parseJsonFromText(text: string): unknown {
   throw new Error('Could not extract JSON from LLM output');
 }
 
-function estimateCost(
-  provider: LlmProvider,
-  tokensIn: number,
-  tokensOut: number,
-  model?: string,
-): number {
-  const rates: Record<LlmProvider, { in: number; out: number }> = {
-    google: { in: 0.075, out: 0.30 },
-    groq: { in: 0.59, out: 0.79 },
-    openrouter: { in: 0.50, out: 1.50 }, // fallback default for paid models (R2)
-    deepseek: { in: 0.14, out: 0.28 },
-    anthropic: { in: 3.0, out: 15.0 },
-  };
-
-  let r = rates[provider] ?? { in: 0.50, out: 1.50 };
-
-  // Refine OpenRouter rates based on actual model routing (R2)
-  if (provider === 'openrouter') {
-    const m = (model ?? '').toLowerCase();
-    if (m.includes(':free') || m.includes('/free')) {
-      r = { in: 0, out: 0 };
-    } else if (m.includes('deepseek')) {
-      r = rates.deepseek;
-    } else if (m.includes('gemini')) {
-      r = rates.google;
-    } else if (m.includes('llama')) {
-      r = { in: 0.35, out: 0.40 };
-    }
-  }
-
-  return (tokensIn / 1_000_000) * r.in + (tokensOut / 1_000_000) * r.out;
-}
-
 export class LlmExecutor implements Executor {
   /** Cooldown expiry timestamp per provider (R3) */
   private readonly cooldowns = new Map<string, number>();
+  private readonly rateLimiter: RateLimiter;
+  private readonly telemetry: TelemetryCollector;
+  private readonly rateLimitTimeoutMs: number;
 
   constructor(private readonly deps: LlmExecutorDeps) {
     if (!deps.gemini && !deps.groq && !deps.openrouter) {
       throw new Error('LlmExecutor requires at least one provider');
+    }
+    this.rateLimiter = deps.rateLimiter ?? new RateLimiter(10, 2);
+    this.telemetry = deps.telemetry ?? globalTelemetry;
+    this.rateLimitTimeoutMs = deps.rateLimitTimeoutMs ?? 2000;
+  }
+
+  /**
+   * Preventive rate limiter slot acquisition.
+   * Awaits until a slot is available or throws RateLimitExceededError if timeout exceeded.
+   */
+  public async acquireRateLimitSlot(maxWaitMs?: number): Promise<void> {
+    const timeout = maxWaitMs ?? this.rateLimitTimeoutMs;
+    const started = Date.now();
+    while (!this.rateLimiter.tryConsume(1)) {
+      if (Date.now() - started >= timeout) {
+        throw new RateLimitExceededError(
+          `Rate limit exceeded: could not acquire token within ${timeout}ms`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
     }
   }
 
@@ -238,26 +242,29 @@ export class LlmExecutor implements Executor {
 
     let lastError: unknown;
     for (const provider of availableProviders) {
+      await this.acquireRateLimitSlot();
       const startedAt = Date.now();
       try {
         const result = await provider.call();
         const latencyMs = Date.now() - startedAt;
+        this.telemetry.recordLatency(latencyMs);
 
         // Clear cooldown on success
         this.cooldowns.delete(provider.name);
 
         const output = parseJsonFromText(result.text);
-        const costUsd = estimateCost(
-          result.provider,
+        const costUsd = calculateTokenCostUsd(
+          result.model,
           result.tokensIn,
           result.tokensOut,
-          result.model,
+          result.provider,
         );
 
         log.info(
           {
             provider: result.provider,
             model: result.model,
+            modelUsed: result.model,
             tokensIn: result.tokensIn,
             tokensOut: result.tokensOut,
             latencyMs,
@@ -270,6 +277,7 @@ export class LlmExecutor implements Executor {
         return {
           output,
           model: result.model,
+          modelUsed: result.model,
           provider: result.provider,
           tokensIn: result.tokensIn,
           tokensOut: result.tokensOut,
@@ -306,14 +314,27 @@ export class LlmExecutor implements Executor {
         this.cooldowns.set(provider.name, Date.now() + cooldownMs);
 
         log.warn(
-          { provider: provider.name, cooldownMs, err },
-          'provider failed, trying next',
+          {
+            provider: provider.name,
+            cooldownMs,
+            error: err instanceof Error ? err.message : String(err),
+          },
+          `Provider ${provider.name} failed, activating fallback to next provider in chain`,
         );
       }
     }
 
+    log.error(
+      {
+        level: 'CRITICAL',
+        providersAttempted: availableProviders.map((p) => p.name),
+        lastError: lastError instanceof Error ? lastError.message : String(lastError),
+      },
+      'CRITICAL: All LLM providers failed in fallback chain',
+    );
+
     throw new Error(
-      'All LLM providers failed: ' +
+      'CRITICAL: All LLM providers failed: ' +
         (lastError instanceof Error ? lastError.message : String(lastError)),
     );
   }
