@@ -1,3 +1,5 @@
+import { EconomicTracker } from '../economic/tracker.js';
+import { BiddingEngine } from '../economic/bidding.js';
 /**
  * Autonomous Agent Core Engine Daemon.
  *
@@ -31,6 +33,16 @@ export interface AgentEngineConfig {
 }
 
 export class AgentEngine {
+  public getEconomicTracker(): EconomicTracker {
+    return this.tracker;
+  }
+  public getBiddingEngine(): BiddingEngine {
+    return this.biddingEngine;
+  }
+
+  private tracker = new EconomicTracker();
+  private biddingEngine = new BiddingEngine(this.tracker);
+
   private readonly signer: Signer;
   private readonly adapters: Map<string, MarketplaceAdapter> = new Map();
   private readonly executor: EngineExecutor;
