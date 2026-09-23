@@ -44,6 +44,20 @@ export interface TaskSettlementInput {
   walletAccountCode?: string;
 }
 
+export interface EscrowLockInput {
+  taskId: string;
+  adapterId: string;
+  amountUsd: number;
+  description?: string;
+}
+
+export interface EscrowRefundInput {
+  taskId: string;
+  adapterId: string;
+  amountUsd: number;
+  description?: string;
+}
+
 interface Entry {
   accountCode: string;
   debit: number;
@@ -392,5 +406,234 @@ export class Ledger {
       [limit],
     );
     return res.rows;
+  }
+
+  /**
+   * Lock funds into escrow: DEBIT escrow_pending, CREDIT wallet.
+   */
+  async lockFunds(input: EscrowLockInput): Promise<string | null> {
+    const round8 = (n: number): number =>
+      Math.round((n + Number.EPSILON) * 1e8) / 1e8;
+    const amount = round8(input.amountUsd);
+    if (amount <= 0) {
+      return null;
+    }
+
+    const walletCode = walletCodeFor(input.adapterId);
+    const entries: Entry[] = [
+      { accountCode: 'escrow_pending', debit: amount, credit: 0 },
+      { accountCode: walletCode, debit: 0, credit: amount },
+    ];
+    const description =
+      input.description ?? 'escrow lock for ' + input.taskId;
+
+    const tx = await withTransaction(async (txn) => {
+      const txRow = await txn.query<{ id: string; created_at: Date }>(
+        `INSERT INTO transactions (task_id, adapter_id, description, status)
+         VALUES ($1, $2, $3, 'pending')
+         RETURNING id, created_at`,
+        [input.taskId, input.adapterId, description],
+      );
+      const txId = txRow.rows[0]!.id;
+      const codes = entries.map((e) => e.accountCode);
+      const accRows = await txn.query<{ id: string; code: string }>(
+        'SELECT id, code FROM accounts WHERE code = ANY($1::text[])',
+        [codes],
+      );
+      const accMap = new Map(accRows.rows.map((r) => [r.code, r.id]));
+      for (const e of entries) {
+        const accId = accMap.get(e.accountCode);
+        if (!accId) {
+          throw new Error('Account not found: ' + e.accountCode);
+        }
+        await txn.query(
+          `INSERT INTO ledger_entries (transaction_id, account_id, debit, credit)
+           VALUES ($1, $2, $3, $4)`,
+          [txId, accId, e.debit.toFixed(8), e.credit.toFixed(8)],
+        );
+      }
+      return { id: txId };
+    });
+
+    log.info(
+      { taskId: input.taskId, adapterId: input.adapterId, txId: tx.id, amountUsd: amount },
+      'escrow locked',
+    );
+    return tx.id;
+  }
+
+  /**
+   * Release escrow into settlement: CREDIT escrow_pending, DEBIT wallet net + fees/costs.
+   */
+  async releaseFunds(input: TaskSettlementInput): Promise<string | null> {
+    const round8 = (n: number): number =>
+      Math.round((n + Number.EPSILON) * 1e8) / 1e8;
+    const walletCode = input.walletAccountCode ?? walletCodeFor(input.adapterId);
+
+    const roundedRevenue = round8(input.revenueUsd);
+    const roundedPlatformFee = round8(input.platformFeeUsd);
+    const roundedExecutionCost = round8(input.executionCostUsd);
+    const roundedGasCost = round8(input.gasCostUsd);
+
+    const entries: Entry[] = [];
+    if (roundedRevenue > 0) {
+      entries.push({
+        accountCode: 'escrow_pending',
+        debit: 0,
+        credit: roundedRevenue,
+      });
+    }
+
+    const computedNet = round8(
+      roundedRevenue - roundedPlatformFee - roundedExecutionCost - roundedGasCost,
+    );
+    if (computedNet > 0) {
+      entries.push({ accountCode: walletCode, debit: computedNet, credit: 0 });
+    }
+    if (roundedPlatformFee > 0) {
+      entries.push({
+        accountCode: 'platform_fee',
+        debit: roundedPlatformFee,
+        credit: 0,
+      });
+    }
+    if (roundedExecutionCost > 0) {
+      entries.push({
+        accountCode: 'execution_cost',
+        debit: roundedExecutionCost,
+        credit: 0,
+      });
+    }
+    if (roundedGasCost > 0) {
+      entries.push({
+        accountCode: 'gas_cost',
+        debit: roundedGasCost,
+        credit: 0,
+      });
+    }
+
+    const totalDebit = entries.reduce((s, e) => s + e.debit, 0);
+    const totalCredit = entries.reduce((s, e) => s + e.credit, 0);
+    const diff = Math.round((totalDebit - totalCredit) * 1e8) / 1e8;
+    if (diff !== 0) {
+      const target = entries.find((e) => e.accountCode === walletCode && e.debit > 0);
+      if (target) {
+        target.debit = round8(target.debit - diff);
+      } else if (diff < 0 && entries[0]) {
+        entries[0].credit = round8(entries[0].credit + diff);
+      }
+    }
+
+    const finalDebit = entries.reduce((s, e) => s + e.debit, 0);
+    const finalCredit = entries.reduce((s, e) => s + e.credit, 0);
+    const finalDiff = Math.round((finalDebit - finalCredit) * 1e8) / 1e8;
+    if (finalDiff !== 0) {
+      throw new Error(
+        'Ledger transaction not balanced after adjustment: debit=' +
+          finalDebit +
+          ' credit=' +
+          finalCredit +
+          ' diff=' +
+          finalDiff,
+      );
+    }
+
+    if (entries.length === 0) {
+      return null;
+    }
+
+    const description = 'escrow release for ' + input.taskId;
+    const tx = await withTransaction(async (txn) => {
+      const txRow = await txn.query<{ id: string; created_at: Date }>(
+        `INSERT INTO transactions (task_id, adapter_id, description, status, settled_at)
+         VALUES ($1, $2, $3, 'settled', now())
+         RETURNING id, created_at`,
+        [input.taskId, input.adapterId, description],
+      );
+      const txId = txRow.rows[0]!.id;
+      const codes = entries.map((e) => e.accountCode);
+      const accRows = await txn.query<{ id: string; code: string }>(
+        'SELECT id, code FROM accounts WHERE code = ANY($1::text[])',
+        [codes],
+      );
+      const accMap = new Map(accRows.rows.map((r) => [r.code, r.id]));
+      for (const e of entries) {
+        const accId = accMap.get(e.accountCode);
+        if (!accId) {
+          throw new Error('Account not found: ' + e.accountCode);
+        }
+        await txn.query(
+          `INSERT INTO ledger_entries (transaction_id, account_id, debit, credit)
+           VALUES ($1, $2, $3, $4)`,
+          [txId, accId, e.debit.toFixed(8), e.credit.toFixed(8)],
+        );
+      }
+      return { id: txId };
+    });
+
+    log.info(
+      {
+        taskId: input.taskId,
+        adapterId: input.adapterId,
+        txId: tx.id,
+        revenueUsd: input.revenueUsd,
+      },
+      'escrow released',
+    );
+    return tx.id;
+  }
+
+  /**
+   * Refund escrow: CREDIT escrow_pending, DEBIT wallet.
+   */
+  async refundFunds(input: EscrowRefundInput): Promise<string | null> {
+    const round8 = (n: number): number =>
+      Math.round((n + Number.EPSILON) * 1e8) / 1e8;
+    const amount = round8(input.amountUsd);
+    if (amount <= 0) {
+      return null;
+    }
+
+    const walletCode = walletCodeFor(input.adapterId);
+    const entries: Entry[] = [
+      { accountCode: 'escrow_pending', debit: 0, credit: amount },
+      { accountCode: walletCode, debit: amount, credit: 0 },
+    ];
+    const description =
+      input.description ?? 'escrow refund for ' + input.taskId;
+
+    const tx = await withTransaction(async (txn) => {
+      const txRow = await txn.query<{ id: string; created_at: Date }>(
+        `INSERT INTO transactions (task_id, adapter_id, description, status)
+         VALUES ($1, $2, $3, 'failed')
+         RETURNING id, created_at`,
+        [input.taskId, input.adapterId, description],
+      );
+      const txId = txRow.rows[0]!.id;
+      const codes = entries.map((e) => e.accountCode);
+      const accRows = await txn.query<{ id: string; code: string }>(
+        'SELECT id, code FROM accounts WHERE code = ANY($1::text[])',
+        [codes],
+      );
+      const accMap = new Map(accRows.rows.map((r) => [r.code, r.id]));
+      for (const e of entries) {
+        const accId = accMap.get(e.accountCode);
+        if (!accId) {
+          throw new Error('Account not found: ' + e.accountCode);
+        }
+        await txn.query(
+          `INSERT INTO ledger_entries (transaction_id, account_id, debit, credit)
+           VALUES ($1, $2, $3, $4)`,
+          [txId, accId, e.debit.toFixed(8), e.credit.toFixed(8)],
+        );
+      }
+      return { id: txId };
+    });
+
+    log.info(
+      { taskId: input.taskId, adapterId: input.adapterId, txId: tx.id, amountUsd: amount },
+      'escrow refunded',
+    );
+    return tx.id;
   }
 }

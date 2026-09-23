@@ -88,6 +88,9 @@ const memoryAccounts: AccountRow[] = [
   { id: '11111111-1111-1111-1111-111111111106', code: 'execution_cost', name: 'LLM Execution Cost Expense', type: 'expense', currency: 'USD', created_at: new Date() },
   { id: '11111111-1111-1111-1111-111111111107', code: 'gas_cost', name: 'Gas Cost Expense', type: 'expense', currency: 'USD', created_at: new Date() },
   { id: '11111111-1111-1111-1111-111111111108', code: 'revenue', name: 'Task Revenue', type: 'revenue', currency: 'USD', created_at: new Date() },
+  { id: 'acc-escrow', code: 'escrow_pending', name: 'Escrow Pending', type: 'asset', currency: 'USD', created_at: new Date() },
+  { id: 'acc-equity', code: 'equity', name: 'Retained Earnings', type: 'equity', currency: 'USD', created_at: new Date() },
+  { id: 'acc-internal', code: 'wallet_internal', name: 'Internal Wallet', type: 'asset', currency: 'USD', created_at: new Date() },
 ];
 
 const memoryTransactions: TransactionRow[] = [];
@@ -155,14 +158,20 @@ function executeMemoryQuery<R extends QueryResultRow>(
     const taskId = String(params?.[0] ?? '');
     const adapterId = String(params?.[1] ?? '');
     const description = String(params?.[2] ?? '');
+    const allowedStatus = new Set(['pending', 'settled', 'failed']);
+    const statusFromParam = (params ?? []).find(
+      (p) => typeof p === 'string' && allowedStatus.has(p),
+    );
+    const statusFromSql = lower.match(/'(pending|settled|failed)'/)?.[1];
+    const status = String(statusFromParam ?? statusFromSql ?? 'settled');
     memoryTransactions.unshift({
       id,
       task_id: taskId,
       adapter_id: adapterId,
       description,
-      status: 'settled',
+      status,
       created_at,
-      settled_at: created_at,
+      settled_at: status === 'settled' ? created_at : null,
     });
     return {
       command: 'INSERT',

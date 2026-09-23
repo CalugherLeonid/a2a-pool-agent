@@ -14,6 +14,7 @@ import type { Ledger } from '../core/ledger.js';
 import type { LearningStore } from '../core/learning.js';
 import type { EconomicsConfig } from '../config/economics.js';
 import { createLogger } from '../observability/logger.js';
+import { generateAgentCard } from '../adapters/a2a/agent-card.js';
 
 const log = createLogger('dashboard');
 
@@ -122,6 +123,17 @@ export function createDashboardServer(deps: DashboardDeps): Server {
   app.get('/', (_req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(renderDashboardHtml());
+  });
+
+  app.get('/.well-known/agent-card.json', (_req: Request, res: Response) => {
+    res.json(
+      generateAgentCard({
+        agentId: env.AGENT_ID,
+        name: env.AGENT_NAME,
+        publicKeyPem: deps.signer.pubkeyPem(),
+        minAcceptedRewardUsd: env.MIN_PROFIT_USD,
+      }),
+    );
   });
 
   const port = env.CORE_PORT || 3000;

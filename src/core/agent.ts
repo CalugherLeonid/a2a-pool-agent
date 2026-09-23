@@ -31,6 +31,13 @@ import type { QualityChecker } from './quality.js';
 import type { Ledger } from './ledger.js';
 import type { LearningStore } from './learning.js';
 import type { BudgetGuard } from './budget.js';
+import { AgentWallet } from './agent-wallet.js';
+import type { A2AAgentOrchestrator } from './a2a-orchestrator.js';
+import type { MetaToolRegistry } from './meta-tools/registry.js';
+import type {
+  A2ATaskExecutionRequest,
+  A2ATaskExecutionResult,
+} from './types/a2a.types.js';
 import { canonicalJson, sha256Hash } from '../identity/ed25519.js';
 import { createLogger, type Logger } from '../observability/logger.js';
 
@@ -185,6 +192,29 @@ export class AgentCore {
     }
     taskLog.info({ lockedUntil: acceptance.lockedUntil }, 'accepted');
 
+    const escrowAmountUsd = rawTask.budgetEstimateUsd;
+    try {
+      const escrowTxId = await this.deps.ledger.lockFunds({
+        taskId: rawTask.id,
+        adapterId: adapter.id,
+        amountUsd: escrowAmountUsd,
+      });
+      if (!escrowTxId) {
+        throw new Error('escrow lock was not recorded');
+      }
+      taskLog.info({ escrowTxId, escrowAmountUsd }, 'funds locked in escrow');
+    } catch (err) {
+      taskLog.error({ err, escrowAmountUsd }, 'escrow lock failed — aborting task');
+      try {
+        await adapter.reject(rawTask.id, 'escrow_lock_failed');
+      } catch (rejectErr) {
+        taskLog.error({ err: rejectErr }, 'reject call failed after escrow lock failure');
+      }
+      return;
+    }
+
+    try {
+
     // --- EXECUTE + QUALITY ---
     const loop = await this.executeWithQuality(
       rawTask,
@@ -215,6 +245,16 @@ export class AgentCore {
         );
       } catch (err) {
         taskLog.error({ err }, 'reject call failed');
+      }
+
+      try {
+        await this.deps.ledger.refundFunds({
+          taskId: rawTask.id,
+          adapterId: adapter.id,
+          amountUsd: escrowAmountUsd,
+        });
+      } catch (err) {
+        taskLog.error({ err }, 'escrow refund failed after quality failure');
       }
 
       try {
@@ -277,18 +317,14 @@ export class AgentCore {
     );
 
     // --- LEDGER ---
-    try {
-      await this.deps.ledger.recordSettlement({
-        taskId: rawTask.id,
-        adapterId: adapter.id,
-        revenueUsd: receipt.amountUsd,
-        platformFeeUsd: receipt.platformFeeAmount,
-        executionCostUsd: loop.totalCostUsd,
-        gasCostUsd: 0,
-      });
-    } catch (err) {
-      taskLog.error({ err }, 'ledger settlement failed');
-    }
+    await this.deps.ledger.releaseFunds({
+      taskId: rawTask.id,
+      adapterId: adapter.id,
+      revenueUsd: receipt.amountUsd,
+      platformFeeUsd: receipt.platformFeeAmount,
+      executionCostUsd: loop.totalCostUsd,
+      gasCostUsd: 0,
+    });
 
     // --- LEARNING ---
     try {
@@ -305,6 +341,18 @@ export class AgentCore {
       });
     } catch (err) {
       taskLog.error({ err }, 'learning event record failed');
+    }
+    } catch (err) {
+      try {
+        await this.deps.ledger.refundFunds({
+          taskId: rawTask.id,
+          adapterId: adapter.id,
+          amountUsd: escrowAmountUsd,
+        });
+      } catch (refundErr) {
+        taskLog.error({ err: refundErr }, 'escrow refund failed after task error');
+      }
+      throw err;
     }
   }
 
@@ -478,5 +526,89 @@ export class AgentCore {
       totalCostUsd,
       totalLatencyMs,
     };
+  }
+}
+
+/**
+ * Economic A2A facade for agents that purchase services from peer agents.
+ * It is intentionally separate from AgentCore's marketplace polling loop.
+ */
+export class AutonomousAgent {
+  private readonly wallet: AgentWallet;
+
+  constructor(
+    private readonly agentId: string,
+    private readonly a2aOrchestrator: A2AAgentOrchestrator,
+    private readonly metaToolRegistry: MetaToolRegistry,
+    initialBalance = 1_000,
+  ) {
+    this.wallet = new AgentWallet(agentId, initialBalance);
+  }
+
+  /** Requests a registered Meta-Tool service from a peer through A2A escrow. */
+  public async requestServiceFromPeer(
+    providerAgentId: string,
+    toolId: string,
+    parameters: Record<string, unknown>,
+    maxBudget: number,
+  ): Promise<{
+    success: boolean;
+    output?: unknown;
+    error?: string;
+    costUsd: number;
+  }> {
+    if (!Number.isFinite(maxBudget) || maxBudget <= 0) {
+      return { success: false, error: 'Invalid maximum budget', costUsd: 0 };
+    }
+    if (!this.metaToolRegistry.getLatest(toolId)) {
+      return { success: false, error: `Unknown meta-tool: ${toolId}`, costUsd: 0 };
+    }
+    if (!this.wallet.canAfford(maxBudget)) {
+      return { success: false, error: 'Insufficient balance', costUsd: 0 };
+    }
+
+    const taskId = `task-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+    const request: A2ATaskExecutionRequest = {
+      taskId,
+      toolId,
+      parameters,
+      costUsd: maxBudget,
+      clientAgentId: this.agentId,
+      providerAgentId,
+      timeoutMs: 30_000,
+    };
+
+    const result = await this.a2aOrchestrator.executeA2ATask(request);
+    if (result.success && result.escrowStatus === 'released') {
+      this.wallet.deduct(result.metrics.costUsd);
+    }
+
+    return {
+      success: result.success,
+      ...(result.output === undefined ? {} : { output: result.output }),
+      ...(result.error ? { error: result.error } : {}),
+      costUsd: result.metrics.costUsd,
+    };
+  }
+
+  /** Handles a peer request only when this agent is the declared provider. */
+  public async handleIncomingRequest(
+    request: A2ATaskExecutionRequest,
+  ): Promise<A2ATaskExecutionResult> {
+    if (request.providerAgentId !== this.agentId) {
+      return {
+        success: false,
+        error: 'Agent ID mismatch',
+        escrowStatus: 'failed',
+        metrics: { latencyMs: 0, costUsd: 0 },
+      };
+    }
+
+    return this.a2aOrchestrator.executeA2ATask(request);
+  }
+
+  /** Returns the wallet's currently available balance. */
+  public getBalance(): number {
+    return this.wallet.getBalance();
   }
 }
