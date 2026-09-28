@@ -1,99 +1,119 @@
-# a2a-pool-agent
+# A2A Pool Agent
 
-Multi-marketplace autonomous agent for the A2A pool ecosystem.
+Autonomous multi-marketplace and Agent-to-Agent (A2A) economic agent built with TypeScript.
 
-The agent discovers tasks across multiple marketplaces (Railway, OKX,
-Clustly, and future platforms), makes economic triage decisions based on
-net profit margin, executes with a dynamic model router, delivers signed
-results, and learns from every outcome.
+## Overview
 
-## Status
+**A2A Pool Agent** is a sovereign autonomous agent architecture featuring a dual-engine execution model:
 
-**F1 — Structure & Types** (in progress)
+- **System 1 (Deterministic Fast Path):** Low-latency execution for known, deterministic tasks and local meta-tools without incurring unnecessary LLM or external network overhead.
+- **System 2 (Deep Path & A2A Orchestration):** Deep reasoning, Hierarchical Task Network (HTN) goal decomposition, model routing (Gemini, Groq, OpenRouter), and Agent-to-Agent (A2A) peer delegation.
 
-- [x] Repository structure
-- [x] Core type definitions
-- [x] Adapter interface
-- [ ] Core modules (triage, router, executor, quality, budget, ledger, ...)
-- [ ] Railway adapter
-- [ ] OKX adapter
-- [ ] Clustly adapter
-- [ ] Gateway (FastAPI)
-- [ ] Migrations & store
+The agent operates with an integrated economic and trust layer:
+- **Zero-Trust Identity:** Ed25519 cryptographic request/response signing and dynamic, signed Agent Cards (`.well-known/agent-card.json`).
+- **M2M Economy:** Decentralized escrow contracts, dynamic pricing engines, double-entry bookkeeping (`Ledger`), and historical peer reputation scoring.
+- **Continuous Discovery & Gating:** Background `OpportunityScanner` continuously ingests tasks from marketplaces and external feeds, passing every job through a quantitative `EconomicBrain` before committing compute.
+- **Resilient Evolution:** The **Morphling Loop** and **Ratchet Immune System** dynamically re-plan tasks in flight upon failure (without crashing root goals) and benchmark self-evolving tools before authorizing live hot-reloads.
+- **Receive-Only Solana Settlement:** Tracks real incoming USDC and SOL transfers to the agent's public receive address (`3t7xtNf5vyb7XKMFoNXaZJ7yW4dx8L8CN1LjcCLEacER`) to update internal balances—strictly without private keys or outgoing transaction signing.
 
-See `docs/V1-SCOPE.md` for the full plan.
+---
 
-## Architecture
+## Features
 
-Read `docs/ARCHITECTURE.md` first. Then `docs/ADAPTERS.md` for the
-adapter contract, `docs/ECONOMICS.md` for the triage formula, and
-`docs/LEARNING.md` for the learning schema.
+- **Dual-Engine Execution (System 1 & System 2):**
+  - Deterministic fast-path dispatch for verified meta-tools.
+  - Deep-path triage with multi-provider model routing (Gemini, Groq, OpenRouter) and fallback chains.
+- **Zero-Trust A2A Protocols:**
+  - Ed25519 cryptographic message authentication and passport verification.
+  - Dynamically versioned, cryptographically signed Agent Cards published at `/.well-known/agent-card.json`.
+  - HTTP and WebSocket bidirectional A2A communication transports.
+- **M2M Economic & Financial Layer:**
+  - Machine-to-Machine Escrow (`EscrowSystem`) locking funds during execution with release, dispute, and refund mechanics.
+  - Real-time double-entry ledger (`Ledger`) tracking assets, revenue, and platform fees.
+  - Weighted multidimensional reputation scoring across delivery success, latency, eval scores, and evolutions.
+  - Dynamic pricing engine factoring in baseline margins, workload congestion, and peer reputation.
+- **Opportunity Discovery & Economic Brain:**
+  - `OpportunityScanner` polling external feeds and adapters (including `LocalFeedOpportunityAdapter`).
+  - `EconomicBrain` evaluating opportunities across skill matching, cost-vs-reward ROI calculations, capacity limits, deadline feasibility, and requester reputation.
+  - Strict decision outputs (`ACCEPT`, `REJECT`, `COUNTER_OFFER`) where only `ACCEPT` grants execution permission.
+- **HTN Planning & Morphling Re-planning:**
+  - Hierarchical Task Network (HTN) planner decomposing complex goals into dependency-ordered `TaskGraph` DAGs.
+  - Kahn's topological sorting and dynamic ready-task dependency resolution.
+  - In-flight dynamic re-planning on subtask failures: parameter adaptation (budget/timeout increase), peer failover rerouting, and dynamic node splitting into recovery branches.
+- **Ratchet Immune System:**
+  - Automated sandbox testing and regression benchmarking (`EvalPack`) of candidate meta-tools.
+  - Automatic rollback on performance regression (>20% latency increase) or security violations.
+- **Receive-Only Solana Payment Monitor:**
+  - Public receive-only wallet monitoring on Solana mainnet.
+  - Detects verified incoming USDC (SPL token) and native SOL transfers via standard JSON-RPC.
+  - Automatically credits the double-entry ledger and emits telemetry without any private keys or payment simulation.
+- **Production Hardening & Observability:**
+  - Resilient circuit breakers with state transitions (`CLOSED`, `OPEN`, `HALF_OPEN`) protecting against cascading provider and peer failures.
+  - Multi-tier granular rate limiter (global, per-peer, and per-skill token buckets).
+  - Atomic snapshot persistence for reputation, escrow, telemetry, and card history (`.tmp` write + atomic rename).
+  - Health (`/health`), readiness (`/ready`), Prometheus metrics (`/metrics`), and REST dashboard endpoints.
 
-## Quick start
+---
 
-Prerequisites: Node 22+, pnpm 9+ / npm 10+.
+## Requirements
+
+- **Node.js:** `>= 22.0.0`
+- **Package Manager:** `npm` (v10+) or `tsx`
+- **Operating System:** Linux, macOS, or Windows (WSL recommended)
+- **Optional External Services:**
+  - PostgreSQL database (for persistent transaction ledger and learning stores; defaults to embedded or mock URL for testing).
+  - Solana RPC Endpoint (e.g. `https://api.mainnet-beta.solana.com` or private RPC provider) for monitoring receive-only payments.
+  - LLM API Keys (optional for local/test mode; configure Gemini, Groq, or OpenRouter for live LLM execution).
+
+---
+
+## Quick Start (Local)
 
 ```bash
-cp .env.example .env
+# 1. Clone the repository
+git clone https://github.com/your-org/a2a-pool-agent.git
+cd a2a-pool-agent
+
+# 2. Install dependencies
 npm install
+
+# 3. Configure environment variables
+cp .env.example .env
+
+# Edit .env with your local settings (ports, database, RPC, and optional LLM keys)
+nano .env
+
+# 4. Run typecheck and automated test suite
+npm run typecheck
+npm test
+
+# 5. Start the development server (hot reload on port 3000)
+npm run dev
+```
+
+### Production Build & Run
+
+```bash
+# Compile TypeScript to dist/
 npm run build
+
+# Start production server
 npm start
 ```
 
-## Production & Hardening (ETAPA 8)
+---
 
-### 1. How to Run in Production
-- **Build**: `npm run build`
-- **Start**: `npm start` (runs `node dist/index.js`)
-- **Development**: `npm run dev` (hot-reloading via `tsx watch src/index.ts`)
-- **Typecheck & Linter**: `npm run typecheck` / `npm run lint`
-- **Test Suite**: `npm test`
+## Operational Endpoints
 
-### 2. Key Environment Variables
-| Variable | Default | Description |
+Once running (default port `3000`), the agent exposes:
+
+| Endpoint | Method | Description |
 |---|---|---|
-| `AGENT_ID` | `00000000-...` | Cryptographic UUID of the agent |
-| `AGENT_ENVIRONMENT` | `production` | Environment tier (`development`, `staging`, `production`) |
-| `CORE_PORT` | `3000` | Port for Dashboard, A2A endpoints, and health probes |
-| `STATE_PERSISTENCE_DIR`| `./data/state` | Directory for atomic JSON state files (reputation, escrow, card history, telemetry) |
-| `SHUTDOWN_TIMEOUT_MS` | `10000` | Maximum time to await in-flight task drain before forcing exit |
-| `CIRCUIT_BREAKER_FAILURES` | `3` | Consecutive failures before tripping downstream circuit breakers |
-| `CIRCUIT_BREAKER_RESET_TIMEOUT_MS` | `30000` | Cooldown period before probing recovery in `HALF_OPEN` state |
-| `A2A_RATE_LIMIT_PER_MINUTE` | `60` | Token bucket limit for inbound A2A requests |
-| `RATCHET_MIN_DELTA` | `0.05` | Minimum quality/performance delta required by Ratchet to accept proposals |
-| `DYNAMIC_PRICING_BASE_PRICE_USD` | `0.05` | Base floor price for tasks |
-| `DYNAMIC_PRICING_MAX_HIKE_RATIO` | `0.10` | Maximum price hike allowed for high-reputation scores |
-| `ENABLE_PROMETHEUS_METRICS` | `true` | Enables plain-text Prometheus exporter on `/metrics` |
-
-### 3. Health & Readiness Endpoints
-- **Liveness Probe**: `GET /health` (or `/api/health`)
-  - Returns `200 OK` with JSON `{ status: "healthy", version: "1.0.0", uptimeSeconds: 360, environment: "production" }`
-  - Returns `status: "draining"` when the agent is shutting down.
-- **Readiness Probe**: `GET /ready` (or `/api/ready`)
-  - Returns `200 OK` when critical dependencies (identity key, double-entry ledger balance, active adapters, and lifecycle) are operational.
-  - Returns `503 Service Unavailable` if an adapter fails, ledger is imbalanced, or the agent is shutting down.
-- **Prometheus Metrics**: `GET /metrics`
-  - Standard Prometheus v0.0.4 text export for counters and gauges: `agent_tasks_total`, `agent_tasks_accepted`, `agent_system1_hit_rate`, `agent_avg_cost_usd`, `agent_ratchet_accepted_total`, `agent_tokens_consumed_total`.
-- **JSON Metrics & Status**: `GET /api/metrics` and `GET /api/status`.
-
-### 4. Version Rollback Procedures
-- **Ratchet Immune System Auto-Rollback**:
-  - The Ratchet immune system automatically benchmarks all candidate code (EvalPack). If a candidate degrades quality, increases latency by >20%, or violates zero-trust safety checks, Ratchet rejects the proposal and immediately rolls back to the previous stable tool version without downtime.
-- **Dynamic Agent Card Rollback**:
-  - The `DynamicAgentCardManager` keeps a tamper-evident audit history of all signed Agent Card versions.
-  - Rollback to an earlier version or build number via API/code:
-    ```ts
-    const result = agentCore.dynamicCardManager.rollback("1.0.0"); // or build number
-    // Automatically re-publishes and re-signs card at /.well-known/agent-card.json and updates PeerRegistry
-    ```
-
-### 5. Graceful Shutdown & Persistence
-- Listens to `SIGTERM` and `SIGINT`.
-- Sets state to draining (rejects new tasks with `503` / `agent_draining`).
-- Awaits in-flight executions up to `SHUTDOWN_TIMEOUT_MS`.
-- Flushes telemetry and writes atomic snapshots (`.tmp` write + atomic `rename`) for:
-  - `reputation.json`
-  - `escrow.json`
-  - `agent-card-history.json`
-  - `telemetry.json`
-- Safely closes server and database connection pools.
+| `/health` | `GET` | Liveness probe returning health state, uptime, and draining status |
+| `/ready` | `GET` | Readiness probe validating cryptographic identity, ledger balance, and active adapters |
+| `/metrics` | `GET` | Plain-text Prometheus metrics export (`version=0.0.4`) |
+| `/api/metrics` | `GET` | JSON aggregated execution metrics, A2A success rates, and token usage |
+| `/api/status` | `GET` | Complete agent operational status, budget state, and account balances |
+| `/api/ledger` | `GET` | Recent double-entry transactions and cryptographic integrity verification |
+| `/api/wallet` | `GET` | Receive-only Solana wallet address, tracked balances, and mint info |
+| `/.well-known/agent-card.json` | `GET` | Cryptographically signed Agent Card (JWS Ed25519) |
