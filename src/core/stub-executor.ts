@@ -11,6 +11,7 @@ import type {
   ExecutionResult,
   Executor,
 } from './executor.js';
+import type { ExecutionTelemetry } from '../telemetry/types.js';
 
 export class StubExecutor implements Executor {
   async execute(input: ExecutionInput): Promise<ExecutionResult> {
@@ -21,6 +22,21 @@ export class StubExecutor implements Executor {
     // task generator uses well-known schemas, we can produce a valid
     // shape that passes the quality checker without an LLM.
     const output = buildStubOutput(input);
+    const latencyMs = Date.now() - startedAt;
+
+    const telemetry: ExecutionTelemetry = {
+      provider: 'groq',
+      model: 'stub-model',
+      latencyMs,
+      tokensIn: 0,
+      tokensOut: 0,
+      costUsd: 0,
+      fallbackUsed: false,
+      fallbackChain: ['stub-model'],
+      systemPath: 'system2',
+      timestamp: new Date().toISOString(),
+      transport: 'local',
+    };
 
     return {
       output,
@@ -30,8 +46,9 @@ export class StubExecutor implements Executor {
       tokensIn: 0,
       tokensOut: 0,
       costUsd: 0,
-      latencyMs: Date.now() - startedAt,
+      latencyMs,
       finishReason: 'stub',
+      telemetry,
     };
   }
 }

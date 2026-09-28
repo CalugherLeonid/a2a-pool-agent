@@ -16,6 +16,8 @@ import {
   createPublicKey,
   generateKeyPairSync,
   sign as cryptoSign,
+  verify as cryptoVerify,
+  type KeyObject,
 } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -26,6 +28,67 @@ export interface Signer {
   sign(message: string): Ed25519Sig;
   /** PEM-encoded public key. */
   pubkeyPem(): string;
+  /** Raw hex-encoded public key (DER SPKI or raw key buffer). */
+  pubkeyHex?(): string;
+}
+
+/** Creates a Signer from private and public KeyObjects. */
+export function createSignerFromKeyObjects(
+  privateKey: KeyObject,
+  publicKey: KeyObject,
+): Signer {
+  const pubPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const pubDer = publicKey.export({ type: 'spki', format: 'der' });
+  return {
+    sign(message: string): Ed25519Sig {
+      const hash = createHash('sha256').update(message).digest();
+      const sig = cryptoSign(null, hash, privateKey);
+      return ('ed25519:' + sig.toString('hex')) as Ed25519Sig;
+    },
+    pubkeyPem(): string {
+      return pubPem;
+    },
+    pubkeyHex(): string {
+      return pubDer.toString('hex');
+    },
+  };
+}
+
+/** Generates a fresh in-memory Ed25519 keypair and returns a Signer. */
+export function generateSigner(): Signer {
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  return createSignerFromKeyObjects(privateKey, publicKey);
+}
+
+/** Verifies an Ed25519 signature against a message string and PEM-encoded public key. */
+export function verifySignature(
+  message: string,
+  signature: string,
+  pubkeyPemOrDerHex: string,
+): boolean {
+  try {
+    const hash = createHash('sha256').update(message).digest();
+    const sigHex = signature.startsWith('ed25519:')
+      ? signature.slice(8)
+      : signature;
+    const sigBuffer = Buffer.from(sigHex, 'hex');
+
+    let publicKey: KeyObject;
+    if (pubkeyPemOrDerHex.includes('BEGIN PUBLIC KEY')) {
+      publicKey = createPublicKey(pubkeyPemOrDerHex);
+    } else {
+      // Treat as DER hex
+      publicKey = createPublicKey({
+        key: Buffer.from(pubkeyPemOrDerHex, 'hex'),
+        format: 'der',
+        type: 'spki',
+      });
+    }
+
+    return cryptoVerify(null, hash, publicKey, sigBuffer);
+  } catch {
+    return false;
+  }
 }
 
 /** Load an Ed25519 private key from a PKCS#8 PEM file, or generate one if missing. */

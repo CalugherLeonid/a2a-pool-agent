@@ -91,6 +91,7 @@ const memoryAccounts: AccountRow[] = [
   { id: 'acc-escrow', code: 'escrow_pending', name: 'Escrow Pending', type: 'asset', currency: 'USD', created_at: new Date() },
   { id: 'acc-equity', code: 'equity', name: 'Retained Earnings', type: 'equity', currency: 'USD', created_at: new Date() },
   { id: 'acc-internal', code: 'wallet_internal', name: 'Internal Wallet', type: 'asset', currency: 'USD', created_at: new Date() },
+  { id: 'acc-solana', code: 'wallet_solana', name: 'Solana USDC/SOL Wallet', type: 'asset', currency: 'USD', created_at: new Date() },
 ];
 
 const memoryTransactions: TransactionRow[] = [];

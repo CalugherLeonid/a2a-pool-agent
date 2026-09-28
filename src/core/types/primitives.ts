@@ -58,4 +58,11 @@ export type SettlementStatus =
   | 'pending_human_claim';
 
 /** Provider identifier for LLM calls. */
-export type LlmProvider = 'google' | 'groq' | 'openrouter' | 'deepseek' | 'anthropic';
+export type LlmProvider =
+  | 'google'
+  | 'groq'
+  | 'openrouter'
+  | 'deepseek'
+  | 'anthropic'
+  | 'meta-tool'
+  | 'peer';

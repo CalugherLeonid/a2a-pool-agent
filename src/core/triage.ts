@@ -15,11 +15,13 @@ import type {
   EconomicDecision,
   ProfitComponents,
   RawTask,
+  ReasoningTier,
   Usd,
 } from './types/index.js';
 import type { AdapterEconomics } from '../config/economics.js';
 import type { CostEstimator } from './cost-estimator.js';
 import type { ModelRouter } from './model-router.js';
+import type { MetaToolRegistry } from './meta-tools/registry.js';
 import { add, div, gt, mul, sub, toNumber } from './money.js';
 import { createLogger } from '../observability/logger.js';
 
@@ -43,7 +45,10 @@ export type TriageReason =
   | 'reject_below_min_budget'
   | 'reject_below_min_profit'
   | 'reject_below_min_success_prob'
-  | 'reject_below_min_time_adjusted';
+  | 'reject_below_min_time_adjusted'
+  | 'reject_expired_deadline'
+  | 'reject_unknown_tool'
+  | 'reject_tool_not_whitelisted';
 
 export interface TriageInput {
   task: RawTask;
@@ -62,6 +67,8 @@ export interface TriageDeps {
   costEstimator: CostEstimator;
   defaultGasCostUsd: Usd;
   delayFloorHours: number;
+  metaToolRegistry?: MetaToolRegistry;
+  toolWhitelist?: string[];
 }
 
 export class TriageEngine {
@@ -71,6 +78,8 @@ export class TriageEngine {
     const { task, adapterId, capabilities } = input;
     const { limits } = capabilities;
 
+    // --- SYSTEM 1 (Deterministic Fast Path & Instant Rule Enforcement) ---
+    // 1. Budget minimum threshold check
     if (task.budgetEstimateUsd < limits.minBudgetUsd) {
       return this.reject(
         input,
@@ -79,16 +88,85 @@ export class TriageEngine {
       );
     }
 
-    const estimatedTimeS = input.estimatedTimeS ?? 30;
-    const confidenceHint = input.confidenceHint ?? 0.5;
+    // 2. Deadline validity check (instant sub-second check)
+    if (task.deadlineS !== undefined && task.deadlineS <= 0) {
+      return this.reject(
+        input,
+        'reject_expired_deadline',
+        'deadline expired or invalid: ' + task.deadlineS,
+      );
+    }
+
+    // 3. Tool whitelist check (if whitelist is configured)
+    if (
+      this.deps.toolWhitelist &&
+      this.deps.toolWhitelist.length > 0 &&
+      !this.deps.toolWhitelist.includes(task.type) &&
+      !this.deps.metaToolRegistry?.getLatest(task.type)
+    ) {
+      return this.reject(
+        input,
+        'reject_tool_not_whitelisted',
+        `task type ${task.type} is not permitted by tool whitelist`,
+      );
+    }
+
+    // 4. Meta-tool identification for System 1 fast path
+    const taskInput =
+      task.input && typeof task.input === 'object'
+        ? (task.input as Record<string, unknown>)
+        : undefined;
+    const taskRaw =
+      task.raw && typeof task.raw === 'object'
+        ? (task.raw as Record<string, unknown>)
+        : undefined;
+
+    const requestedToolId =
+      task.type === 'meta_tool' && typeof taskInput?.toolId === 'string'
+        ? taskInput.toolId
+        : task.type === 'meta_tool' && typeof taskRaw?.toolId === 'string'
+          ? (taskRaw.toolId as string)
+          : undefined;
+
+    if (task.type === 'meta_tool' && requestedToolId && this.deps.metaToolRegistry) {
+      if (!this.deps.metaToolRegistry.getLatest(requestedToolId)) {
+        return this.reject(
+          input,
+          'reject_unknown_tool',
+          `requested meta-tool '${requestedToolId}' is not registered`,
+        );
+      }
+    }
+
+    // Determine reasoning tier: System 1 fast path vs System 2 deep escalation
+    let tier: ReasoningTier = 'system2_deep';
+    let matchedToolId: string | undefined;
+
+    if (requestedToolId && this.deps.metaToolRegistry?.getLatest(requestedToolId)) {
+      tier = 'system1_fast';
+      matchedToolId = requestedToolId;
+    } else if (this.deps.metaToolRegistry?.getLatest(task.type)) {
+      tier = 'system1_fast';
+      matchedToolId = task.type;
+    }
+
+    const estimatedTimeS = input.estimatedTimeS ?? (tier === 'system1_fast' ? 5 : 30);
+    const confidenceHint = input.confidenceHint ?? (tier === 'system1_fast' ? 0.95 : 0.5);
     const estimatedGasCostUsd =
       input.estimatedGasCostUsd ?? this.deps.defaultGasCostUsd;
 
-    const costEstimate = await this.deps.costEstimator.estimate(
-      task.type,
-      adapterId,
-      1 - confidenceHint,
-    );
+    // In System 1, deterministic execution in sandbox has negligible cost (no expensive LLM tokens)
+    let expectedExecutionCostUsd: number;
+    if (tier === 'system1_fast') {
+      expectedExecutionCostUsd = 0.0001;
+    } else {
+      const costEstimate = await this.deps.costEstimator.estimate(
+        task.type,
+        adapterId,
+        1 - confidenceHint,
+      );
+      expectedExecutionCostUsd = costEstimate.estimatedUsd;
+    }
 
     const expectedRevenueUsd = task.budgetEstimateUsd;
     const platformFeePct = limits.platformFeePct;
@@ -96,7 +174,6 @@ export class TriageEngine {
     const expectedNetRevenueUsd = toNumber(
       sub(expectedRevenueUsd, platformFeeUsd),
     );
-    const expectedExecutionCostUsd = costEstimate.estimatedUsd;
     const expectedTotalCostUsd = toNumber(
       add(expectedExecutionCostUsd, estimatedGasCostUsd),
     );
@@ -129,10 +206,9 @@ export class TriageEngine {
       timeAdjustedProfit,
     };
 
-    const successProbability = await this.deps.successProb.get(
-      task.type,
-      adapterId,
-    );
+    const successProbability = tier === 'system1_fast'
+      ? 0.98
+      : await this.deps.successProb.get(task.type, adapterId);
 
     const thresholds = {
       minProfitUsd: this.deps.thresholds.minProfitUsd,
@@ -140,10 +216,13 @@ export class TriageEngine {
       minTimeAdjustedProfit: this.deps.thresholds.minTimeAdjustedProfit,
     };
 
-    // --- Model from router (unless explicitly provided) ---
+    // --- Model from router (or deterministic for System 1) ---
     const model =
-      input.model ?? (await this.deps.modelRouter.select(task.type, adapterId));
-    const strategyId = 'default';
+      input.model ??
+      (tier === 'system1_fast'
+        ? 'deterministic-tool'
+        : await this.deps.modelRouter.select(task.type, adapterId));
+    const strategyId = tier === 'system1_fast' ? 'system1_fast' : 'default';
 
     if (!gt(expectedProfitUsd, thresholds.minProfitUsd)) {
       return this.rejectWith(
@@ -157,6 +236,7 @@ export class TriageEngine {
         successProbability,
         model,
         strategyId,
+        tier,
       );
     }
 
@@ -172,6 +252,7 @@ export class TriageEngine {
         successProbability,
         model,
         strategyId,
+        tier,
       );
     }
 
@@ -187,6 +268,7 @@ export class TriageEngine {
         successProbability,
         model,
         strategyId,
+        tier,
       );
     }
 
@@ -196,7 +278,8 @@ export class TriageEngine {
         taskId: task.id,
         taskType: task.type,
         model,
-        costSource: costEstimate.source,
+        tier,
+        matchedToolId,
         expectedProfitUsd,
         timeAdjustedProfit,
         successProbability,
@@ -213,6 +296,8 @@ export class TriageEngine {
       strategyId,
       model,
       reason: 'accept',
+      tier,
+      matchedToolId,
     };
   }
 
@@ -251,9 +336,10 @@ export class TriageEngine {
         minTimeAdjustedProfit: this.deps.thresholds.minTimeAdjustedProfit,
       },
       successProbability: 0,
-      strategyId: 'default',
+      strategyId: 'system1_fast',
       model: input.model ?? 'unselected',
       reason,
+      tier: 'system1_fast',
     };
   }
 
@@ -265,8 +351,9 @@ export class TriageEngine {
     successProbability: number,
     model: string,
     strategyId: string,
+    tier: ReasoningTier = 'system2_deep',
   ): EconomicDecision {
-    log.debug({ reason, detail }, 'reject');
+    log.debug({ reason, detail, tier }, 'reject');
     return {
       decision: 'REJECT',
       confidence: 0,
@@ -276,6 +363,7 @@ export class TriageEngine {
       strategyId,
       model,
       reason,
+      tier,
     };
   }
 }

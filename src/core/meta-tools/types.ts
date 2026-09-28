@@ -1,3 +1,5 @@
+import type { ExecutionTelemetry } from '../../telemetry/types.js';
+
 export interface MetaToolDefinition {
   id: string;
   name: string;
@@ -26,4 +28,5 @@ export interface MetaToolExecutionResult {
   ratchetDecision: 'accepted' | 'rejected' | 'rolled_back';
   metrics: Record<string, number>;
   toolVersionUsed: number;
+  telemetry?: ExecutionTelemetry;
 }

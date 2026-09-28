@@ -1,3 +1,5 @@
+import type { ExecutionTelemetry } from '../../telemetry/types.js';
+
 export interface EscrowSystemInterface {
   lockFunds(params: {
     taskId: string;
@@ -28,6 +30,14 @@ export interface A2ATaskExecutionRequest {
   providerAgentId: string;
   /** Defaults to 30 seconds at the execution boundary. */
   timeoutMs?: number;
+  /** Ed25519 cryptographic signature of the request payload */
+  signature?: string;
+  /** Public key (PEM or hex) of the requesting client agent */
+  signerPubkey?: string;
+  /** ISO 8601 UTC timestamp when the request was signed */
+  timestamp?: string;
+  /** Expiration timestamp for replay & delay protection */
+  expiresAt?: string;
 }
 
 export interface MetaToolExecutionResult {
@@ -36,6 +46,7 @@ export interface MetaToolExecutionResult {
   error?: string;
   ratchetDecision: 'accepted' | 'rejected' | 'rolled_back';
   metrics?: Record<string, unknown>;
+  telemetry?: ExecutionTelemetry;
 }
 
 export interface A2ATaskExecutionResult {
@@ -48,4 +59,12 @@ export interface A2ATaskExecutionResult {
     latencyMs: number;
     costUsd: number;
   };
+  /** Ed25519 cryptographic signature of the result payload */
+  signature?: string;
+  /** Public key of the provider agent */
+  signerPubkey?: string;
+  /** ISO 8601 UTC timestamp when result was signed */
+  timestamp?: string;
+  /** Comprehensive execution telemetry */
+  telemetry?: ExecutionTelemetry;
 }

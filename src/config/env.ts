@@ -64,6 +64,36 @@ const EnvSchema = z.object({
   CORE_PORT: z.coerce.number().int().positive().default(3000),
   GATEWAY_PORT: z.coerce.number().int().positive().default(8000),
   POLL_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
+
+  // --- Production & Hardening --------------------------------------
+  STATE_PERSISTENCE_DIR: z.string().min(1).default('./data/state'),
+  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  A2A_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().positive().default(60),
+  CIRCUIT_BREAKER_FAILURES: z.coerce.number().int().positive().default(3),
+  CIRCUIT_BREAKER_RESET_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+  ENABLE_PROMETHEUS_METRICS: z.coerce.boolean().default(true),
+
+  // --- Ratchet & Morphling Immune System ---------------------------
+  RATCHET_MIN_DELTA: z.coerce.number().min(0).max(1).default(0.05),
+
+  // --- Dynamic Pricing Engine --------------------------------------
+  DYNAMIC_PRICING_BASE_PRICE_USD: z.coerce.number().positive().default(0.05),
+  DYNAMIC_PRICING_MIN_REWARD_USD: z.coerce.number().positive().default(0.05),
+  DYNAMIC_PRICING_MAX_HIKE_RATIO: z.coerce.number().min(0).max(1).default(0.10),
+
+  // --- Timeouts ----------------------------------------------------
+  A2A_TASK_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+
+  // --- Reputation Weights -----------------------------------------
+  REPUTATION_DELIVERY_WEIGHT: z.coerce.number().min(0).max(1).default(0.40),
+  REPUTATION_DEADLINE_WEIGHT: z.coerce.number().min(0).max(1).default(0.20),
+  REPUTATION_EVAL_WEIGHT: z.coerce.number().min(0).max(1).default(0.25),
+  REPUTATION_EVOLUTION_WEIGHT: z.coerce.number().min(0).max(1).default(0.15),
+
+  // --- Solana Receive Wallet ---------------------------------------
+  SOLANA_RPC_URL: z.string().url().default('https://api.mainnet-beta.solana.com'),
+  SOLANA_RECEIVE_ADDRESS: z.string().min(32).default('3t7xtNf5vyb7XKMFoNXaZJ7yW4dx8L8CN1LjcCLEacER'),
+  USDC_MINT: z.string().min(32).default('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

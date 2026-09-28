@@ -32,6 +32,23 @@ import { createModelRouter } from './core/model-router.js';
 import { loadSignerFromPemPath, type Signer } from './identity/ed25519.js';
 import { closePool } from './persistence/pool.js';
 import { createDashboardServer } from './server/dashboard.js';
+import { A2ACapability } from './core/a2a-capability.js';
+import { A2AAgentOrchestrator } from './core/a2a-orchestrator.js';
+import { MetaToolRegistry } from './core/meta-tools/registry.js';
+import { MetaToolManager } from './core/meta-tools/manager.js';
+import { Sandbox } from './core/sandbox.js';
+import { EvalPack } from './core/eval-pack.js';
+import { RatchetSystem } from './core/ratchet.js';
+import { EscrowSystem } from './core/escrow.js';
+import { StatePersistenceManager } from './persistence/state-persistence.js';
+import { CircuitBreakerRegistry } from './core/resilience/circuit-breaker.js';
+import { GranularRateLimiter } from './core/resilience/granular-rate-limiter.js';
+import { SolanaReceiveWallet } from './core/solana-wallet.js';
+import { OpportunityScanner } from './core/opportunity/scanner.js';
+import { EconomicBrain } from './core/opportunity/economic-brain.js';
+import { LocalFeedOpportunityAdapter } from './core/opportunity/local-feed-adapter.js';
+import { HTNPlanner } from './core/htn/planner.js';
+import { MorphlingReplanEngine } from './core/htn/morphling-replan.js';
 
 const log = createLogger('main');
 
@@ -153,6 +170,26 @@ async function main(): Promise<void> {
     economics.min_learning_events,
   );
 
+  // --- A2A & Meta-Tools Architecture ---
+  const metaToolRegistry = new MetaToolRegistry();
+  const sandbox = new Sandbox();
+  const evalPack = new EvalPack();
+  const ratchetSystem = new RatchetSystem();
+  const metaToolManager = new MetaToolManager(
+    metaToolRegistry,
+    sandbox,
+    evalPack,
+    ratchetSystem,
+  );
+  const escrow = new EscrowSystem();
+  const a2aOrchestrator = new A2AAgentOrchestrator(metaToolManager, escrow);
+  const a2aCapability = new A2ACapability({
+    orchestrator: a2aOrchestrator,
+    metaToolManager,
+    metaToolRegistry,
+    escrow,
+  });
+
   // --- Triage ---
   const primaryAdapterId = registry.ids()[0] ?? 'mock';
   const thresholds = thresholdsFor(economics, primaryAdapterId);
@@ -163,6 +200,7 @@ async function main(): Promise<void> {
     costEstimator,
     defaultGasCostUsd: economics.estimated_gas_cost_usd,
     delayFloorHours: economics.delay_floor_hours,
+    metaToolRegistry,
   });
 
   // --- Budget guard (hard gate) ---
@@ -175,6 +213,47 @@ async function main(): Promise<void> {
   const executor = pickExecutor();
   const quality = new QualityChecker();
   const ledger = new Ledger();
+
+  // --- Resilience & Persistence Subsystems ---
+  const persistenceManager = new StatePersistenceManager({
+    storageDir: env.STATE_PERSISTENCE_DIR,
+  });
+
+  const circuitBreakers = new CircuitBreakerRegistry({
+    failureThreshold: env.CIRCUIT_BREAKER_FAILURES,
+    resetTimeoutMs: env.CIRCUIT_BREAKER_RESET_TIMEOUT_MS,
+  });
+
+  const granularRateLimiter = new GranularRateLimiter({
+    global: {
+      limitPerMinute: env.A2A_RATE_LIMIT_PER_MINUTE * 2,
+      maxTokens: 30,
+      refillRatePerSec: 5,
+    },
+    peerDefaults: {
+      limitPerMinute: env.A2A_RATE_LIMIT_PER_MINUTE,
+      maxTokens: 15,
+      refillRatePerSec: 2,
+    },
+  });
+
+  // --- Solana Receive-Only Wallet ---
+  const solanaWallet = new SolanaReceiveWallet({
+    ledger,
+  });
+
+  // --- Opportunity Scanner & Economic Brain ---
+  const localFeedAdapter = new LocalFeedOpportunityAdapter();
+  const economicBrain = new EconomicBrain({
+    escrowSystem: escrow,
+  });
+  const opportunityScanner = new OpportunityScanner({
+    brain: economicBrain,
+    adapters: [localFeedAdapter],
+    pollIntervalMs: env.POLL_INTERVAL_MS,
+  });
+  const htnPlanner = new HTNPlanner();
+  const morphlingReplan = new MorphlingReplanEngine();
 
   // --- Agent Core ---
   const core = new AgentCore({
@@ -189,7 +268,19 @@ async function main(): Promise<void> {
     agentId: env.AGENT_ID,
     workerId: env.AGENT_NAME,
     delayFloorHours: economics.delay_floor_hours,
+    a2aCapability,
+    persistenceManager,
+    circuitBreakers,
+    granularRateLimiter,
+    solanaWallet,
+    opportunityScanner,
+    economicBrain,
+    htnPlanner,
+    morphlingReplan,
   });
+
+  // Hydrate persisted state from disk
+  await core.hydrateState();
 
   // --- Dashboard HTTP Server (Port 3000) ---
   const startTime = new Date();
@@ -201,12 +292,13 @@ async function main(): Promise<void> {
     learning,
     economics,
     startTime,
+    agentCore: core,
   });
 
   const shutdown = async (signal: string): Promise<void> => {
     log.info({ signal }, 'shutdown signal received');
     server.close();
-    await core.stop();
+    await core.stop(env.SHUTDOWN_TIMEOUT_MS);
     await closePool();
     process.exit(0);
   };

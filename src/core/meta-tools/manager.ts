@@ -2,6 +2,7 @@ import type { EvalReport } from '../eval-pack.js';
 import { EvalPack } from '../eval-pack.js';
 import { RatchetSystem } from '../ratchet.js';
 import { Sandbox } from '../sandbox.js';
+import type { ExecutionTelemetry } from '../../telemetry/types.js';
 import type { MetaToolExecutionResult } from './types.js';
 import { derivePolicyFromRatchet } from './policies.js';
 import { MetaToolRegistry } from './registry.js';
@@ -26,6 +27,7 @@ export class MetaToolManager {
       : this.registry.getVersion(toolId, targetVersion);
 
     if (!tool) {
+      const latencyMs = Date.now() - startedAt;
       return {
         success: false,
         output: null,
@@ -34,8 +36,21 @@ export class MetaToolManager {
           : `Meta-tool not found: ${toolId} version ${targetVersion}`,
         evaluationScore: 0,
         ratchetDecision: 'rejected',
-        metrics: { latencyMs: Date.now() - startedAt },
+        metrics: { latencyMs },
         toolVersionUsed: targetVersion ?? 0,
+        telemetry: {
+          provider: 'meta-tool',
+          model: toolId,
+          latencyMs,
+          tokensIn: 0,
+          tokensOut: 0,
+          costUsd: 0,
+          fallbackUsed: false,
+          fallbackChain: ['meta-tool'],
+          systemPath: 'system1',
+          timestamp: new Date().toISOString(),
+          transport: 'local',
+        },
       };
     }
 
@@ -65,6 +80,21 @@ export class MetaToolManager {
     const ratchet = this.ratchetSystem.processEvaluation(effectiveReport);
     const accepted = effectiveReport.passed && ratchet.action === 'accept';
 
+    const latencyMs = Date.now() - startedAt;
+    const telemetry: ExecutionTelemetry = {
+      provider: 'meta-tool',
+      model: tool.id,
+      latencyMs,
+      tokensIn: 0,
+      tokensOut: 0,
+      costUsd: 0.0001,
+      fallbackUsed: false,
+      fallbackChain: ['meta-tool'],
+      systemPath: 'system1',
+      timestamp: new Date().toISOString(),
+      transport: 'local',
+    };
+
     return {
       success: accepted,
       output: sandboxResult.stdout,
@@ -72,10 +102,11 @@ export class MetaToolManager {
       evaluationScore: effectiveReport.score,
       ratchetDecision: this.ratchetDecision(ratchet.action),
       metrics: {
-        latencyMs: Date.now() - startedAt,
+        latencyMs,
         sandboxDurationMs: sandboxResult.durationMs,
       },
       toolVersionUsed: tool.version,
+      telemetry,
     };
   }
 
@@ -91,6 +122,13 @@ export class MetaToolManager {
         score: 0,
         failures: [`evaluation_error: ${this.errorMessage(err)}`],
         durationMs: 0,
+        details: [
+          {
+            checkId: 'evaluation-error',
+            success: false,
+            error: this.errorMessage(err),
+          },
+        ],
       };
     }
   }
@@ -138,6 +176,18 @@ export class MetaToolManager {
     if (action === 'accept') return 'accepted';
     if (action === 'rollback') return 'rolled_back';
     return 'rejected';
+  }
+
+  getRatchetSystem(): RatchetSystem {
+    return this.ratchetSystem;
+  }
+
+  getEvalPack(): EvalPack {
+    return this.evalPack;
+  }
+
+  getRegistry(): MetaToolRegistry {
+    return this.registry;
   }
 
   private errorMessage(err: unknown): string {

@@ -17,6 +17,7 @@ import { callGroq, type GroqConfig } from './llm/groq.js';
 import { callOpenRouter, type OpenRouterConfig } from './llm/openrouter.js';
 import { RateLimiter } from './resilience/rate-limiter.js';
 import { globalTelemetry, type TelemetryCollector } from '../telemetry/metrics.js';
+import type { ExecutionTelemetry } from '../telemetry/types.js';
 import { calculateTokenCostUsd } from './cost-estimator.js';
 import { createLogger } from '../observability/logger.js';
 
@@ -47,6 +48,7 @@ export interface ExecutionResult {
   costUsd: number;
   latencyMs: number;
   finishReason: string;
+  telemetry: ExecutionTelemetry;
 }
 
 export interface Executor {
@@ -241,7 +243,10 @@ export class LlmExecutor implements Executor {
     }
 
     let lastError: unknown;
+    const attemptedChain: string[] = [];
+
     for (const provider of availableProviders) {
+      attemptedChain.push(provider.name);
       await this.acquireRateLimitSlot();
       const startedAt = Date.now();
       try {
@@ -260,6 +265,25 @@ export class LlmExecutor implements Executor {
           result.provider,
         );
 
+        const fallbackUsed = attemptedChain.length > 1;
+        const fallbackChain = [...attemptedChain];
+
+        const telemetry: ExecutionTelemetry = {
+          provider: result.provider,
+          model: result.model,
+          latencyMs,
+          tokensIn: result.tokensIn,
+          tokensOut: result.tokensOut,
+          costUsd,
+          fallbackUsed,
+          fallbackChain,
+          systemPath: 'system2',
+          timestamp: new Date().toISOString(),
+          transport: 'local',
+        };
+
+        this.telemetry.recordExecution(telemetry, true);
+
         log.info(
           {
             provider: result.provider,
@@ -269,7 +293,10 @@ export class LlmExecutor implements Executor {
             tokensOut: result.tokensOut,
             latencyMs,
             costUsd,
+            fallbackUsed,
+            fallbackChain,
             attempt: input.attempt ?? 0,
+            telemetry,
           },
           'executed',
         );
@@ -284,6 +311,7 @@ export class LlmExecutor implements Executor {
           costUsd,
           latencyMs,
           finishReason: result.finishReason,
+          telemetry,
         };
       } catch (err) {
         lastError = err;
@@ -317,6 +345,7 @@ export class LlmExecutor implements Executor {
           {
             provider: provider.name,
             cooldownMs,
+            fallbackChain: [...attemptedChain],
             error: err instanceof Error ? err.message : String(err),
           },
           `Provider ${provider.name} failed, activating fallback to next provider in chain`,
@@ -327,7 +356,7 @@ export class LlmExecutor implements Executor {
     log.error(
       {
         level: 'CRITICAL',
-        providersAttempted: availableProviders.map((p) => p.name),
+        providersAttempted: attemptedChain,
         lastError: lastError instanceof Error ? lastError.message : String(lastError),
       },
       'CRITICAL: All LLM providers failed in fallback chain',

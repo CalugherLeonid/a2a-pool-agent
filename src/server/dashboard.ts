@@ -15,6 +15,7 @@ import type { LearningStore } from '../core/learning.js';
 import type { EconomicsConfig } from '../config/economics.js';
 import { createLogger } from '../observability/logger.js';
 import { generateAgentCard } from '../adapters/a2a/agent-card.js';
+import { globalTelemetry, type TelemetryCollector } from '../telemetry/metrics.js';
 
 const log = createLogger('dashboard');
 
@@ -26,20 +27,120 @@ export interface DashboardDeps {
   learning: LearningStore;
   economics: EconomicsConfig;
   startTime: Date;
+  agentCore?: {
+    isDraining?: () => boolean;
+    getInFlightTaskCount?: () => number;
+    dynamicCardManager?: {
+      getVersion?: () => string;
+      getCurrentCard?: () => any;
+    };
+    reputationSystem?: any;
+  };
+  telemetry?: TelemetryCollector;
+  port?: number;
 }
 
 export function createDashboardServer(deps: DashboardDeps): Server {
   const app = express();
   app.use(express.json());
 
-  // Health check
+  const telemetry = deps.telemetry ?? globalTelemetry;
+
+  // Liveness probe: /health
   app.get(['/health', '/api/health'], (_req: Request, res: Response) => {
+    const isDraining = deps.agentCore?.isDraining ? deps.agentCore.isDraining() : false;
+    const version = deps.agentCore?.dynamicCardManager?.getVersion
+      ? deps.agentCore.dynamicCardManager.getVersion()
+      : '1.0.0';
+
     res.json({
-      status: 'ok',
+      status: isDraining ? 'draining' : 'healthy',
       agentId: env.AGENT_ID,
       agentName: env.AGENT_NAME,
+      version,
       environment: env.AGENT_ENVIRONMENT,
       uptimeSeconds: Math.floor((Date.now() - deps.startTime.getTime()) / 1000),
+    });
+  });
+
+  // Readiness probe: /ready
+  app.get(['/ready', '/api/ready'], async (_req: Request, res: Response) => {
+    const uptimeSeconds = Math.floor((Date.now() - deps.startTime.getTime()) / 1000);
+    const version = deps.agentCore?.dynamicCardManager?.getVersion
+      ? deps.agentCore.dynamicCardManager.getVersion()
+      : '1.0.0';
+
+    const checks: Record<string, { status: 'ok' | 'error'; details?: string }> = {};
+
+    // 1. Identity Check
+    try {
+      const pubkey = deps.signer.pubkeyPem();
+      checks.identity = pubkey ? { status: 'ok' } : { status: 'error', details: 'Signer key missing' };
+    } catch (e) {
+      checks.identity = { status: 'error', details: String(e) };
+    }
+
+    // 2. Ledger Check
+    try {
+      const integrity = await deps.ledger.verifyIntegrity();
+      checks.ledger = integrity.balanced
+        ? { status: 'ok' }
+        : { status: 'error', details: 'Ledger integrity verification failed' };
+    } catch (e) {
+      checks.ledger = { status: 'error', details: String(e) };
+    }
+
+    // 3. Registry & Adapters Check
+    try {
+      const activeIds = deps.registry.ids();
+      checks.registry = activeIds.length > 0
+        ? { status: 'ok', details: `${activeIds.length} adapters active` }
+        : { status: 'error', details: 'No active marketplace adapters' };
+    } catch (e) {
+      checks.registry = { status: 'error', details: String(e) };
+    }
+
+    // 4. Shutdown / Draining Status
+    const isDraining = deps.agentCore?.isDraining ? deps.agentCore.isDraining() : false;
+    const inFlight = deps.agentCore?.getInFlightTaskCount ? deps.agentCore.getInFlightTaskCount() : 0;
+    checks.lifecycle = !isDraining
+      ? { status: 'ok', details: `in-flight tasks: ${inFlight}` }
+      : { status: 'error', details: `agent is draining (shutting down), in-flight: ${inFlight}` };
+
+    const isReady = Object.values(checks).every((c) => c.status === 'ok');
+
+    if (isReady) {
+      res.status(200).json({
+        status: 'ready',
+        agentId: env.AGENT_ID,
+        agentName: env.AGENT_NAME,
+        version,
+        uptimeSeconds,
+        checks,
+      });
+    } else {
+      res.status(503).json({
+        status: 'not_ready',
+        agentId: env.AGENT_ID,
+        agentName: env.AGENT_NAME,
+        version,
+        uptimeSeconds,
+        checks,
+      });
+    }
+  });
+
+  // Prometheus Metrics: /metrics
+  app.get('/metrics', (_req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+    res.send(telemetry.toPrometheusText());
+  });
+
+  // JSON Metrics: /api/metrics
+  app.get('/api/metrics', (_req: Request, res: Response) => {
+    res.json({
+      aggregated: telemetry.getAggregatedMetrics(),
+      raw: telemetry.getMetrics(),
     });
   });
 
@@ -136,7 +237,7 @@ export function createDashboardServer(deps: DashboardDeps): Server {
     );
   });
 
-  const port = env.CORE_PORT || 3000;
+  const port = deps.port !== undefined ? deps.port : (env.CORE_PORT || 3000);
   const server = app.listen(port, '0.0.0.0', () => {
     log.info({ port, host: '0.0.0.0' }, 'dashboard server listening');
   });

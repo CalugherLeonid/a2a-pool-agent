@@ -2,6 +2,8 @@ import type { Probability, Usd } from './primitives.js';
 
 export type TriageDecision = 'ACCEPT' | 'REJECT' | 'NEGOTIATE';
 
+export type ReasoningTier = 'system1_fast' | 'system2_deep';
+
 /**
  * Every intermediate value used in the economic triage formula.
  * Persisted in audit logs alongside the decision.
@@ -34,4 +36,6 @@ export interface EconomicDecision {
   strategyId: string;
   model: string;
   reason: string;
+  tier?: ReasoningTier;
+  matchedToolId?: string;
 }

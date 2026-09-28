@@ -1,3 +1,5 @@
+import { globalTelemetry, type TelemetryCollector } from '../telemetry/metrics.js';
+
 export type EscrowStatus = 'LOCKED' | 'RELEASED' | 'REFUNDED' | 'FAILED';
 
 export interface EscrowRecord {
@@ -30,8 +32,14 @@ export class EscrowSystem implements EscrowSystemInterface {
   private store: Map<string, EscrowRecord> = new Map();
   private taskIdToEscrowIdMap: Map<string, string> = new Map();
   private reconciliationQueue: Set<string> = new Set();
+  private readonly telemetry: TelemetryCollector;
 
-  constructor(private readonly maxRetries: number = 3) {}
+  constructor(
+    private readonly maxRetries: number = 3,
+    telemetry?: TelemetryCollector,
+  ) {
+    this.telemetry = telemetry ?? globalTelemetry;
+  }
 
   public async lockFunds(params: LockFundsParams): Promise<{ success: boolean; escrowId?: string; error?: string }> {
     const { taskId, amount, from, to } = params;
@@ -65,6 +73,16 @@ export class EscrowSystem implements EscrowSystemInterface {
 
     this.store.set(escrowId, record);
     this.taskIdToEscrowIdMap.set(taskId, escrowId);
+
+    this.telemetry.recordEscrowEvent('locked', {
+      taskId,
+      escrowId,
+      amountUsd: amount,
+      amount,
+      from,
+      to,
+      peerId: to,
+    });
     
     return { success: true, escrowId };
   }
@@ -80,7 +98,7 @@ export class EscrowSystem implements EscrowSystemInterface {
       return { success: false, error: `Cannot release funds from status: ${record.status}` };
     }
 
-    return this.executeWithRetry(
+    const res = await this.executeWithRetry(
       async () => {
         record.status = 'RELEASED';
         record.updatedAt = new Date();
@@ -91,6 +109,20 @@ export class EscrowSystem implements EscrowSystemInterface {
       taskId,
       'release'
     );
+
+    if (res.success) {
+      this.telemetry.recordEscrowEvent('released', {
+        taskId,
+        escrowId,
+        amountUsd: record.amount,
+        amount: record.amount,
+        from: record.from,
+        to: record.to,
+        peerId: record.to,
+      });
+    }
+
+    return res;
   }
 
   public async refundFunds(taskId: string, escrowId: string, reason: string): Promise<{ success: boolean; error?: string }> {
@@ -117,6 +149,19 @@ export class EscrowSystem implements EscrowSystemInterface {
       'refund'
     );
 
+    if (result.success) {
+      this.telemetry.recordEscrowEvent('refunded', {
+        taskId,
+        escrowId,
+        amountUsd: record.amount,
+        amount: record.amount,
+        from: record.from,
+        to: record.to,
+        peerId: record.to,
+        reason,
+      });
+    }
+
     if (!result.success) {
       record.status = 'FAILED';
       record.failureReason = `Refund failed after retries: ${result.error}`;
@@ -130,6 +175,50 @@ export class EscrowSystem implements EscrowSystemInterface {
 
   public getStuckTransactions(): string[] {
     return Array.from(this.reconciliationQueue);
+  }
+
+  public getRecordByTaskId(taskId: string): EscrowRecord | undefined {
+    const escrowId = this.taskIdToEscrowIdMap.get(taskId);
+    return escrowId ? this.store.get(escrowId) : undefined;
+  }
+
+  public getRecordById(escrowId: string): EscrowRecord | undefined {
+    return this.store.get(escrowId);
+  }
+
+  public getAllRecords(): EscrowRecord[] {
+    return Array.from(this.store.values());
+  }
+
+  /**
+   * Exports all escrow records for persistence.
+   */
+  public exportState(): EscrowRecord[] {
+    return Array.from(this.store.values()).map((r) => ({ ...r }));
+  }
+
+  /**
+   * Imports previously persisted escrow records.
+   */
+  public importState(records: Array<EscrowRecord | Record<string, unknown>>): void {
+    if (!Array.isArray(records)) return;
+    for (const raw of records) {
+      if (raw && typeof raw === 'object' && 'escrowId' in raw && 'taskId' in raw) {
+        const rec: EscrowRecord = {
+          escrowId: String(raw.escrowId),
+          taskId: String(raw.taskId),
+          amount: Number(raw.amount) || 0,
+          from: String(raw.from),
+          to: String(raw.to),
+          status: raw.status as EscrowStatus,
+          createdAt: new Date((raw.createdAt as string | Date) || Date.now()),
+          updatedAt: new Date((raw.updatedAt as string | Date) || Date.now()),
+          failureReason: raw.failureReason ? String(raw.failureReason) : undefined,
+        };
+        this.store.set(rec.escrowId, rec);
+        this.taskIdToEscrowIdMap.set(rec.taskId, rec.escrowId);
+      }
+    }
   }
 
   private getRecord(taskId: string, escrowId: string): EscrowRecord | undefined {

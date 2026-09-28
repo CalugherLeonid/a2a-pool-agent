@@ -58,6 +58,17 @@ export interface EscrowRefundInput {
   description?: string;
 }
 
+export interface PaymentDepositInput {
+  txHash: string;
+  fromAddress: string;
+  toAddress: string;
+  amountUsd: number;
+  asset: string;
+  network: string;
+  description?: string;
+  walletAccountCode?: string;
+}
+
 interface Entry {
   accountCode: string;
   debit: number;
@@ -235,6 +246,98 @@ export class Ledger {
       taskId,
       adapterId,
       description: 'settlement for ' + taskId,
+      status: 'settled',
+      entries: entries.map((e) => ({
+        transactionId: tx.id,
+        accountCode: e.accountCode,
+        debit: e.debit,
+        credit: e.credit,
+      })),
+      createdAt: tx.createdAt.toISOString(),
+      settledAt: tx.createdAt.toISOString(),
+    };
+  }
+
+  /**
+   * Record a real on-chain incoming payment / deposit.
+   * Idempotent on txHash: if already recorded, returns existing or null.
+   * Total debits == total credits.
+   */
+  async recordPaymentDeposit(
+    input: PaymentDepositInput,
+  ): Promise<LedgerTransaction | null> {
+    const { txHash, fromAddress, toAddress, amountUsd, asset, network } = input;
+    const walletCode = input.walletAccountCode ?? 'wallet_solana';
+
+    // Idempotency check on txHash
+    const existing = await query<{ id: string }>(
+      'SELECT id FROM transactions WHERE task_id = $1 LIMIT 1',
+      [txHash],
+    );
+    if (existing.rows.length > 0) {
+      log.debug({ txHash }, 'payment deposit already recorded, skipping');
+      return null;
+    }
+
+    const round8 = (n: number): number =>
+      Math.round((n + Number.EPSILON) * 1e8) / 1e8;
+    const roundedAmount = round8(amountUsd);
+
+    if (roundedAmount <= 0) {
+      log.warn({ txHash, amountUsd }, 'ignoring zero or negative payment deposit');
+      return null;
+    }
+
+    const entries: Entry[] = [
+      { accountCode: walletCode, debit: roundedAmount, credit: 0 },
+      { accountCode: 'revenue', debit: 0, credit: roundedAmount },
+    ];
+
+    const description =
+      input.description ??
+      `Incoming ${asset} on ${network} from ${fromAddress} to ${toAddress}`;
+
+    const tx = await withTransaction(async (txn) => {
+      const txRow = await txn.query<{ id: string; created_at: Date }>(
+        `INSERT INTO transactions (task_id, adapter_id, description, status, settled_at)
+         VALUES ($1, $2, $3, 'settled', now())
+         RETURNING id, created_at`,
+        [txHash, network, description],
+      );
+      const txId = txRow.rows[0]!.id;
+
+      const codes = entries.map((e) => e.accountCode);
+      const accRows = await txn.query<{ id: string; code: string }>(
+        'SELECT id, code FROM accounts WHERE code = ANY($1::text[])',
+        [codes],
+      );
+      const accMap = new Map(accRows.rows.map((r) => [r.code, r.id]));
+
+      for (const e of entries) {
+        const accId = accMap.get(e.accountCode);
+        if (!accId) {
+          throw new Error('Account not found: ' + e.accountCode);
+        }
+        await txn.query(
+          `INSERT INTO ledger_entries (transaction_id, account_id, debit, credit)
+           VALUES ($1, $2, $3, $4)`,
+          [txId, accId, e.debit.toFixed(8), e.credit.toFixed(8)],
+        );
+      }
+
+      return { id: txId, createdAt: txRow.rows[0]!.created_at };
+    });
+
+    log.info(
+      { txHash, network, asset, amountUsd: roundedAmount, fromAddress, toAddress, txId: tx.id },
+      'on-chain incoming payment recorded in ledger',
+    );
+
+    return {
+      id: tx.id,
+      taskId: txHash,
+      adapterId: network,
+      description,
       status: 'settled',
       entries: entries.map((e) => ({
         transactionId: tx.id,

@@ -2,6 +2,7 @@ import { EvalPack } from '../../eval-pack.js';
 import type { EvalReport } from '../../eval-pack.js';
 import { RatchetSystem } from '../../ratchet.js';
 import { Sandbox } from '../../sandbox.js';
+import { SandboxSecurityGuard } from '../../sandbox/security-guard.js';
 import { MetaToolRegistry } from '../registry.js';
 import type { MetaToolDefinition } from '../types.js';
 
@@ -10,6 +11,9 @@ export interface HotReloadInput {
   newSourceCode: string;
   description?: string;
   parametersSchema?: Record<string, unknown>;
+  currentScore?: number;
+  currentLatencyMs?: number;
+  currentCostUsd?: number;
 }
 
 export interface HotReloadOutput {
@@ -20,7 +24,7 @@ export interface HotReloadOutput {
   error?: string;
 }
 
-/** Validates a candidate source update before appending a new tool version. */
+/** Validates a candidate source update through the immune system before appending a new tool version. */
 export class HotReloadTool {
   constructor(
     private readonly registry: MetaToolRegistry,
@@ -55,22 +59,57 @@ export class HotReloadTool {
       };
     }
 
-    const sandboxResult = await this.sandbox.executeCode(input.newSourceCode);
-    const evaluationReport = await this.evaluateSafely(sandboxResult, {
-      toolId: existing.id,
-      currentVersion: existing.version,
-      parametersSchema: input.parametersSchema ?? existing.parametersSchema,
-    });
-    const ratchetResult = this.ratchetSystem.processEvaluation(evaluationReport);
-    const ratchetDecision = this.ratchetDecision(ratchetResult.action);
-
-    if (!evaluationReport.passed || ratchetResult.action !== 'accept') {
+    // 1. Static Security Guard check
+    const securityAudit = SandboxSecurityGuard.auditSourceCode(input.newSourceCode);
+    if (!securityAudit.passed) {
+      const syntheticReport: EvalReport = {
+        passed: false,
+        score: 0,
+        failures: securityAudit.violations,
+        durationMs: 0,
+        details: [
+          {
+            checkId: 'security-audit',
+            success: false,
+            description: 'Static security audit',
+            error: securityAudit.violations.join('; '),
+          },
+        ],
+      };
+      this.ratchetSystem.processEvaluation(syntheticReport);
       return {
         success: false,
-        evaluationReport,
+        evaluationReport: syntheticReport,
+        ratchetDecision: 'rolled_back',
+        error: `Immune system rejected hot reload: ${securityAudit.violations.join('; ')}`,
+      };
+    }
+
+    // 2. Full Ratchet evaluation
+    const proposalResult = await this.ratchetSystem.evaluateCandidateProposal({
+      toolId: existing.id,
+      sourceCode: input.newSourceCode,
+      metadata: {
+        name: existing.name,
+        description: input.description ?? existing.description,
+        parametersSchema: input.parametersSchema ?? existing.parametersSchema,
+      },
+      currentVersion: existing.version,
+      currentCode: existing.sourceCode,
+      currentScore: input.currentScore ?? 0.75,
+      currentLatencyMs: input.currentLatencyMs,
+      currentCostUsd: input.currentCostUsd,
+      evalPack: this.evalPack,
+    });
+
+    const ratchetDecision = proposalResult.accepted ? 'accepted' : 'rolled_back';
+
+    if (!proposalResult.accepted) {
+      return {
+        success: false,
+        evaluationReport: proposalResult.evalResult,
         ratchetDecision,
-        error: sandboxResult.error ?? (sandboxResult.stderr.trim() ||
-          `Hot reload rejected: ${ratchetResult.reason}`),
+        error: proposalResult.reason,
       };
     }
 
@@ -86,41 +125,17 @@ export class HotReloadTool {
       return {
         success: true,
         tool,
-        evaluationReport,
-        ratchetDecision,
+        evaluationReport: proposalResult.evalResult,
+        ratchetDecision: 'accepted',
       };
     } catch (err) {
       return {
         success: false,
-        evaluationReport,
+        evaluationReport: proposalResult.evalResult,
         ratchetDecision: 'rejected',
         error: `Hot reload registration failed: ${this.errorMessage(err)}`,
       };
     }
-  }
-
-  private async evaluateSafely(
-    sandboxResult: Awaited<ReturnType<Sandbox['executeCode']>>,
-    context: Record<string, unknown>,
-  ): Promise<EvalReport> {
-    try {
-      return await this.evalPack!.evaluate(sandboxResult, context);
-    } catch (err) {
-      return {
-        passed: false,
-        score: 0,
-        failures: [`evaluation_error: ${this.errorMessage(err)}`],
-        durationMs: 0,
-      };
-    }
-  }
-
-  private ratchetDecision(
-    action: 'accept' | 'rollback' | 'tighten',
-  ): HotReloadOutput['ratchetDecision'] {
-    if (action === 'accept') return 'accepted';
-    if (action === 'rollback') return 'rolled_back';
-    return 'rejected';
   }
 
   private errorMessage(err: unknown): string {
